@@ -1,272 +1,178 @@
-from datetime import datetime, timezone
+"""
+Fonga ishlaydigan vazifalar:
+1. E'lonlarni foydalanuvchi akkauntidan yuborish (bot emas)
+2. Muddati tugagan foydalanuvchilarni tekshirish
+3. Yopilgan e'lonlarni o'chirish
+"""
+import asyncio
+import logging
+from datetime import datetime
+from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
-from loguru import logger
 
-from database.connection import AsyncSessionFactory
-from database.crud import (
-    get_all_open_announcements,
-    get_channels_by_user_id,
-    update_announcement_last_sent,
-    close_announcement,
-    delete_old_closed_announcements,
-    get_users_expiring_today,
-    deactivate_user,
-    get_all_connected_sessions,
-    mark_session_disconnected,
-    deactivate_channel,
-    close_user_announcements,
-)
-from services import pyrogram_client as pyro
-from services.email_service import send_expiry_warning, send_session_disconnected
+from database.connection import AsyncSessionLocal
+from database import crud
+import config
+from services.pyrogram_client import get_client, send_to_channel
 
-# Global scheduler
-scheduler = AsyncIOScheduler(timezone="Asia/Tashkent")
+logger = logging.getLogger(__name__)
 
-# Bot referansini saqlash (main.py da set qilinadi)
-_bot = None
-_admin_phone = ""
-_admin_username = ""
+scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
 
 
-def set_bot(bot, admin_phone: str, admin_username: str):
-    """Bot obyektini va admin ma'lumotlarini o'rnatish"""
-    global _bot, _admin_phone, _admin_username
-    _bot = bot
-    _admin_phone = admin_phone
-    _admin_username = admin_username
-
-
-# ============================================================
-# 1. E'LON YUBORUVCHI (har daqiqada)
-# ============================================================
-
-async def send_announcements_job():
+async def send_announcements(bot: Bot):
     """
-    Ochiq e'lonlarni tekshirib, intervaliga qarab yuboradi.
     Har daqiqada ishga tushadi.
+    Vaqti kelgan e'lonlarni foydalanuvchi akkauntidan yuboradi.
+    (Bot nomidan EMAS — foydalanuvchi o'z akkauntidan yozadi)
     """
-    if not _bot:
-        return
-
-    now = datetime.now(timezone.utc)
-
-    async with AsyncSessionFactory() as session:
+    async with AsyncSessionLocal() as db:
         try:
-            announcements = await get_all_open_announcements(session)
+            announcements = await crud.get_open_announcements(db)
+            now = datetime.utcnow()
 
             for ann in announcements:
                 # Interval tekshiruvi
                 if ann.last_sent_at:
-                    last = ann.last_sent_at
-                    if last.tzinfo is None:
-                        last = last.replace(tzinfo=timezone.utc)
-                    elapsed_minutes = (now - last).total_seconds() / 60
-                    if elapsed_minutes < ann.interval_minutes:
-                        continue  # Hali vaqt kelmagan
+                    elapsed = (now - ann.last_sent_at).total_seconds() / 60
+                    if elapsed < ann.interval_minutes:
+                        continue
 
-                # Foydalanuvchi kanallarini olish
-                channels = await get_channels_by_user_id(session, ann.user_id)
+                user = ann.user
+                if not user or not user.is_active:
+                    continue
+                if user.expires_at < now:
+                    continue
+
+                # Foydalanuvchi Telegram session (akkaunt)
+                sess_str = await crud.get_session(db, user.id)
+                if not sess_str:
+                    logger.warning(
+                        f"User {user.id} sessionsiz — e'lon yuborilmadi"
+                    )
+                    continue
+
+                # Foydalanuvchi akkauntining Pyrogram clienti
+                client = await get_client(user.id, sess_str)
+                if not client:
+                    logger.error(
+                        f"User {user.id} client xatosi — e'lon yuborilmadi"
+                    )
+                    continue
+
+                channels = await crud.get_user_channels(db, user.id)
                 if not channels:
                     continue
 
-                # Xabar yuborish
-                success_count, fail_count, failed_ids = await pyro.send_to_all_channels(
-                    user_id=ann.user_id,
-                    channels=channels,
-                    text=ann.message_text,
-                )
+                sent_count = 0
+                failed_count = 0
+                failed_ch_ids = []
 
-                # Muvaffaqiyatsiz kanallarni o'chirish
-                if failed_ids:
-                    for ch_id in failed_ids:
-                        await deactivate_channel(session, ch_id)
-                    logger.info(
-                        f"E'lon {ann.id}: {success_count} ta yuborildi, "
-                        f"{fail_count} ta yuborilmadi va o'chirildi"
+                # Foydalanuvchi akkauntidan har bir guruh/kanalga yuborish
+                for ch in channels:
+                    success, reason = await send_to_channel(
+                        client, ch.link, ann.message_text
                     )
-                    # Foydalanuvchiga xabar
-                    try:
-                        await _bot.send_message(
-                            ann.user_id,  # bu telegram_id emas, user.telegram_id kerak
-                            f"ℹ️ E'lon #{ann.id}: {success_count} ta guruhga yuborildi, "
-                            f"{fail_count} ta guruh mavjud emas va o'chirildi.",
-                            parse_mode="HTML"
+                    if success:
+                        sent_count += 1
+                        await crud.add_send_log(db, ann.id, ch.id, True)
+                        logger.info(
+                            f"✅ User {user.id} akkauntidan {ch.link} ga yuborildi"
                         )
-                    except Exception:
-                        pass
-
-                # Oxirgi yuborish vaqtini yangilash
-                await update_announcement_last_sent(session, ann.id)
-
-            await session.commit()
-
-        except Exception as e:
-            await session.rollback()
-            logger.error(f"send_announcements_job xatosi: {e}")
-
-
-# ============================================================
-# 2. MUDDAT TEKSHIRUVI (har kecha 23:59)
-# ============================================================
-
-async def check_expiry_job():
-    """
-    Muddati tugagan foydalanuvchilarni topib, ularni deaktiv qiladi.
-    Har kecha 23:59 da ishga tushadi.
-    """
-    if not _bot:
-        return
-
-    async with AsyncSessionFactory() as session:
-        try:
-            expiring_users = await get_users_expiring_today(session)
-
-            for user in expiring_users:
-                # Deaktiv qilish
-                await deactivate_user(session, user.id)
-
-                # Ochiq e'lonlarni yopish
-                closed_count = await close_user_announcements(session, user.id)
-
-                # Sessiyani o'chirish
-                await pyro.disconnect_client(user.id)
-
-                logger.info(
-                    f"Muddat tugadi: user_id={user.id}, "
-                    f"telegram_id={user.telegram_id}, "
-                    f"{closed_count} ta e'lon yopildi"
-                )
-
-                # Foydalanuvchiga xabar
-                await send_expiry_warning(
-                    _bot,
-                    user.telegram_id,
-                    _admin_phone,
-                    _admin_username
-                )
-
-            await session.commit()
-            if expiring_users:
-                logger.info(f"Jami {len(expiring_users)} ta foydalanuvchi muddati tugadi")
-
-        except Exception as e:
-            await session.rollback()
-            logger.error(f"check_expiry_job xatosi: {e}")
-
-
-# ============================================================
-# 3. YOPILGAN E'LONLARNI O'CHIRISH (har kecha 00:00)
-# ============================================================
-
-async def cleanup_closed_announcements_job():
-    """
-    Kecha yopilgan e'lonlarni o'chiradi.
-    Har kecha 00:00 da ishga tushadi.
-    """
-    async with AsyncSessionFactory() as session:
-        try:
-            deleted = await delete_old_closed_announcements(session)
-            await session.commit()
-            if deleted:
-                logger.info(f"Tozalash: {deleted} ta yopilgan e'lon o'chirildi")
-        except Exception as e:
-            await session.rollback()
-            logger.error(f"cleanup_closed_announcements_job xatosi: {e}")
-
-
-# ============================================================
-# 4. SESSIYA TEKSHIRUVI (har 30 daqiqada)
-# ============================================================
-
-async def check_sessions_job():
-    """
-    Barcha ulangan sessiyalarni tekshirib, uzilganlarini aniqlaydi.
-    Har 30 daqiqada ishga tushadi.
-    """
-    if not _bot:
-        return
-
-    async with AsyncSessionFactory() as session:
-        try:
-            sessions = await get_all_connected_sessions(session)
-
-            for db_session in sessions:
-                is_alive = await pyro.check_client_alive(db_session.user_id)
-                if not is_alive:
-                    await mark_session_disconnected(session, db_session.id)
-                    logger.warning(
-                        f"Sessiya uzilgan: session_id={db_session.id}, "
-                        f"user_id={db_session.user_id}"
-                    )
-                    # Foydalanuvchiga xabar yuborish uchun telegram_id kerak
-                    # user_id bu DB id, telegram_id ni olish kerak
-                    # Bu relation orqali olinadi
-                    if db_session.user and db_session.user.telegram_id:
-                        await send_session_disconnected(
-                            _bot,
-                            db_session.user.telegram_id
+                    else:
+                        failed_count += 1
+                        failed_ch_ids.append(ch.id)
+                        await crud.add_send_log(db, ann.id, ch.id, False, reason)
+                        logger.warning(
+                            f"❌ {ch.link}: {reason}"
                         )
 
-            await session.commit()
+                    await asyncio.sleep(config.SESSION_SEND_DELAY)
+
+                # Kirish imkoni yo'q kanallarni o'chirish
+                for ch_id in failed_ch_ids:
+                    await crud.deactivate_channel(db, ch_id)
+
+                await crud.update_last_sent(db, ann.id)
+                await db.commit()
+
+                # Foydalanuvchiga natija
+                if failed_count > 0:
+                    await bot.send_message(
+                        user.telegram_id,
+                        f"📊 E'lon natijasi:\n"
+                        f"✅ {sent_count} ta guruhga yetkazildi\n"
+                        f"❌ {failed_count} ta guruh o'chirildi "
+                        f"(akkauntingiz a'zo emas yoki yozish huquqi yo'q)"
+                    )
 
         except Exception as e:
-            await session.rollback()
-            logger.error(f"check_sessions_job xatosi: {e}")
+            logger.error(f"send_announcements xatosi: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
 
-# ============================================================
-# SCHEDULER ISHGA TUSHIRISH VA TO'XTATISH
-# ============================================================
+async def check_expired_users(bot: Bot):
+    """Har kecha 23:59 da ishga tushadi"""
+    async with AsyncSessionLocal() as db:
+        try:
+            expired = await crud.get_expired_users(db)
+            for user in expired:
+                await crud.close_all_user_announcements(db, user.id)
+                await crud.deactivate_user(db, user.id)
+                await db.commit()
 
-def start_scheduler():
-    """Barcha scheduled vazifalarni ro'yxatdan o'tkazib ishga tushirish"""
+                try:
+                    await bot.send_message(
+                        user.telegram_id,
+                        f"⏰ Sizning bot ishlatish muddatingiz tugadi!\n\n"
+                        f"Davom etish uchun admin bilan bog'laning:\n"
+                        f"📞 {config.ADMIN_PHONE}\n"
+                        f"💬 @{config.ADMIN_USERNAME}"
+                    )
+                except Exception:
+                    pass
 
-    # 1. E'lon yuboruvchi — har daqiqada
+            logger.info(f"Muddati tugagan: {len(expired)} ta foydalanuvchi")
+        except Exception as e:
+            logger.error(f"check_expired_users xatosi: {e}")
+
+
+async def delete_old_announcements():
+    """Har kecha 00:00 da ishga tushadi"""
+    async with AsyncSessionLocal() as db:
+        try:
+            await crud.delete_old_closed_announcements(db)
+            await db.commit()
+            logger.info("Eski yopilgan e'lonlar o'chirildi")
+        except Exception as e:
+            logger.error(f"delete_old_announcements xatosi: {e}")
+
+
+def setup_scheduler(bot: Bot):
     scheduler.add_job(
-        send_announcements_job,
-        trigger=IntervalTrigger(minutes=1),
+        send_announcements,
+        trigger="interval",
+        minutes=1,
+        args=[bot],
         id="send_announcements",
-        name="E'lon yuboruvchi",
         replace_existing=True,
-        misfire_grace_time=30,
     )
-
-    # 2. Muddat tekshiruvi — har kecha 23:59
     scheduler.add_job(
-        check_expiry_job,
+        check_expired_users,
         trigger=CronTrigger(hour=23, minute=59),
-        id="check_expiry",
-        name="Muddat tekshiruvi",
+        args=[bot],
+        id="check_expired",
         replace_existing=True,
     )
-
-    # 3. Eski e'lonlarni o'chirish — har kecha 00:00
     scheduler.add_job(
-        cleanup_closed_announcements_job,
+        delete_old_announcements,
         trigger=CronTrigger(hour=0, minute=0),
-        id="cleanup_announcements",
-        name="Yopilgan e'lonlarni tozalash",
+        id="delete_old",
         replace_existing=True,
     )
-
-    # 4. Sessiya tekshiruvi — har 30 daqiqada
-    scheduler.add_job(
-        check_sessions_job,
-        trigger=IntervalTrigger(minutes=30),
-        id="check_sessions",
-        name="Sessiya tekshiruvi",
-        replace_existing=True,
-        misfire_grace_time=60,
-    )
-
     scheduler.start()
-    logger.info("✅ Scheduler ishga tushdi (4 ta vazifa)")
-
-
-def stop_scheduler():
-    """Schedulerni to'xtatish"""
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("⛔ Scheduler to'xtatildi")
+    logger.info("✅ Scheduler ishga tushdi")

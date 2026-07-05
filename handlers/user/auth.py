@@ -1,167 +1,146 @@
+"""
+Foydalanuvchi kirish va parol o'zgartirish
+"""
 from aiogram import Router, F
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
-from loguru import logger
 
-from database.crud import (
-    get_user_by_telegram_id,
-    increment_user_wrong_attempts,
-    reset_user_wrong_attempts,
-    get_first_admin,
-)
-from utils.password_generator import verify_password
-from utils.keyboards import get_user_main_menu, get_start_keyboard
-from utils.helpers import clear_state, is_expired, format_date
-from handlers.user.states import UserAuthStates
+from database import crud
+from utils.keyboards import user_main_menu, start_keyboard
+import config
 
 router = Router()
 
-MAX_ATTEMPTS = 10
+
+class UserAuthStates(StatesGroup):
+    waiting_password = State()
+    waiting_old_password = State()
+    waiting_new_password = State()
+    waiting_confirm_password = State()
 
 
-# ============================================================
-# KIRISH JARAYONI
-# ============================================================
-
+# ─── Kirish ────────────────────────────────────────────────────────────
 @router.message(F.text == "👤 Foydalanuvchi sifatida kirish")
-async def user_login_start(message: Message, state: FSMContext, session: AsyncSession):
-    """Foydalanuvchi kirish tugmasi bosildi"""
-    # Allaqachon login bo'lganmi?
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if user and user.is_active and not is_expired(user.expires_at):
-        await state.update_data(user_id=user.id, telegram_id=user.telegram_id)
-        await message.answer(
-            "✅ Siz allaqachon kirgansiz!",
-            reply_markup=get_user_main_menu()
-        )
-        return
-
+async def user_login_start(message: Message, state: FSMContext):
     await state.set_state(UserAuthStates.waiting_password)
     await message.answer(
-        "🔑 <b>Parolingizni kiriting:</b>",
-        reply_markup=__import__("aiogram").types.ReplyKeyboardRemove(),
-        parse_mode="HTML"
+        "🔑 Parolingizni kiriting:\n\n"
+        "❓ Agar parolingiz bo'lmasa, admin bilan bog'laning:\n"
+        f"📞 {config.ADMIN_PHONE}\n"
+        f"💬 @{config.ADMIN_USERNAME}"
     )
 
 
 @router.message(UserAuthStates.waiting_password)
-async def user_login_password(message: Message, state: FSMContext, session: AsyncSession):
-    """Foydalanuvchi parolni kiritdi"""
-    telegram_id = message.from_user.id
-    password = message.text.strip() if message.text else ""
+async def user_login_check(message: Message, state: FSMContext,
+                             db: AsyncSession):
+    password = message.text.strip()
+    tg_id = message.from_user.id
 
-    # Foydalanuvchini topish
-    user = await get_user_by_telegram_id(session, telegram_id)
+    success, user = await crud.verify_user_password(db, tg_id, password)
+    await db.commit()
 
-    if not user:
+    if success:
+        await state.clear()
+        await state.update_data(user_logged_in=True)
         await message.answer(
-            "❌ <b>Sizning Telegram ID bazada topilmadi.</b>\n"
-            "Admin bilan bog'laning.",
-            parse_mode="HTML",
-            reply_markup=get_start_keyboard()
+            f"✅ Xush kelibsiz!\n\n"
+            f"📅 Muddatingiz: {user.expires_at.strftime('%d.%m.%Y')} gacha",
+            reply_markup=user_main_menu()
         )
-        await clear_state(state)
         return
 
-    # Bloklangan (10 ta urinish)
-    if user.wrong_attempts >= MAX_ATTEMPTS:
-        admin = await get_first_admin(session)
-        admin_info = ""
-        if admin:
-            admin_info = f"\n📞 {admin.phone or 'N/A'}\n💬 @{admin.username or 'N/A'}"
+    if user is None:
         await message.answer(
-            f"🚫 <b>Parol {MAX_ATTEMPTS} marta noto'g'ri kiritildi.</b>\n"
-            f"Admin bilan bog'laning:{admin_info}",
-            parse_mode="HTML",
-            reply_markup=get_start_keyboard()
+            "❌ Siz tizimda ro'yxatdan o'tmagansiz.\n"
+            f"Admin bilan bog'laning: 📞 {config.ADMIN_PHONE}"
         )
-        await clear_state(state)
+        await state.clear()
         return
 
-    # Parol tekshiruvi
-    if not verify_password(password, user.password_hash):
-        attempts = await increment_user_wrong_attempts(session, telegram_id)
-        remaining = MAX_ATTEMPTS - attempts
-
-        if remaining <= 0:
-            admin = await get_first_admin(session)
-            admin_info = ""
-            if admin:
-                admin_info = f"\n📞 {admin.phone or 'N/A'}\n💬 @{admin.username or 'N/A'}"
-            await message.answer(
-                f"🚫 <b>Parol {MAX_ATTEMPTS} marta noto'g'ri kiritildi.</b>\n"
-                f"Admin bilan bog'laning:{admin_info}",
-                parse_mode="HTML",
-                reply_markup=get_start_keyboard()
-            )
-            await clear_state(state)
-        else:
-            await message.answer(
-                f"❌ <b>Parol noto'g'ri!</b>\n"
-                f"Qolgan urinishlar: <b>{remaining}</b> ta",
-                parse_mode="HTML"
-            )
-        return
-
-    # Muddat tekshiruvi
-    if is_expired(user.expires_at):
-        admin = await get_first_admin(session)
-        admin_info = ""
-        if admin:
-            admin_info = f"\n📞 {admin.phone or 'N/A'}\n💬 @{admin.username or 'N/A'}"
+    # Foydalanuvchi topildi lekin kirish muvaffaqiyatsiz
+    from datetime import datetime
+    if user.expires_at < datetime.utcnow():
         await message.answer(
-            f"⏰ <b>Botdan foydalanish muddatingiz tugagan.</b>\n"
-            f"Davom etish uchun admin bilan bog'laning:{admin_info}",
-            parse_mode="HTML",
-            reply_markup=get_start_keyboard()
+            "⏰ Sizning muddatingiz tugagan!\n\n"
+            f"Davom etish uchun admin bilan bog'laning:\n"
+            f"📞 {config.ADMIN_PHONE}\n"
+            f"💬 @{config.ADMIN_USERNAME}"
         )
-        await clear_state(state)
+        await state.clear()
         return
 
-    # Aktiv emas
-    if not user.is_active:
+    # Noto'g'ri parol
+    attempts = user.wrong_attempts
+    remaining = config.MAX_WRONG_ATTEMPTS - attempts
+
+    if attempts >= config.MAX_WRONG_ATTEMPTS:
         await message.answer(
-            "🚫 <b>Akkauntingiz bloklangan.</b>\n"
-            "Admin bilan bog'laning.",
-            parse_mode="HTML",
-            reply_markup=get_start_keyboard()
+            f"🚫 Parol {config.MAX_WRONG_ATTEMPTS} marta noto'g'ri kiritildi!\n\n"
+            f"Admin bilan bog'laning:\n"
+            f"📞 {config.ADMIN_PHONE}\n"
+            f"💬 @{config.ADMIN_USERNAME}",
+            reply_markup=start_keyboard()
         )
-        await clear_state(state)
+        await state.clear()
+    else:
+        await message.answer(
+            f"❌ Parol noto'g'ri!\n"
+            f"⚠️ {remaining} ta urinish qoldi."
+        )
+
+
+# ─── Parol o'zgartirish ────────────────────────────────────────────────
+@router.message(F.text == "🔑 Parolni o'zgartirish")
+async def change_password_start(message: Message, state: FSMContext):
+    await state.set_state(UserAuthStates.waiting_old_password)
+    await message.answer("🔑 Eski parolingizni kiriting:")
+
+
+@router.message(UserAuthStates.waiting_old_password)
+async def change_password_old(message: Message, state: FSMContext,
+                               db: AsyncSession):
+    old_password = message.text.strip()
+    tg_id = message.from_user.id
+    success, user = await crud.verify_user_password(db, tg_id, old_password)
+
+    if not success or user is None:
+        await message.answer("❌ Eski parol noto'g'ri! Qayta urinib ko'ring.")
         return
 
-    # Muvaffaqiyatli kirish
-    await reset_user_wrong_attempts(session, telegram_id)
-    await state.update_data(user_id=user.id, telegram_id=user.telegram_id)
-    await state.set_state(None)
+    await state.update_data(user_id=user.id)
+    await state.set_state(UserAuthStates.waiting_new_password)
+    await message.answer("🆕 Yangi parolingizni kiriting (kamida 6 belgi):")
 
-    expires_str = format_date(user.expires_at)
+
+@router.message(UserAuthStates.waiting_new_password)
+async def change_password_new(message: Message, state: FSMContext):
+    new_pw = message.text.strip()
+    if len(new_pw) < 6:
+        await message.answer("❌ Parol kamida 6 belgi bo'lishi kerak!")
+        return
+    await state.update_data(new_password=new_pw)
+    await state.set_state(UserAuthStates.waiting_confirm_password)
+    await message.answer("🔄 Yangi parolni tasdiqlang (qayta kiriting):")
+
+
+@router.message(UserAuthStates.waiting_confirm_password)
+async def change_password_confirm(message: Message, state: FSMContext,
+                                   db: AsyncSession):
+    data = await state.get_data()
+    confirm = message.text.strip()
+
+    if confirm != data.get("new_password"):
+        await message.answer("❌ Parollar mos kelmadi! Qayta kiriting:")
+        await state.set_state(UserAuthStates.waiting_new_password)
+        return
+
+    await crud.update_user_password(db, data["user_id"], confirm)
+    await db.commit()
+    await state.clear()
     await message.answer(
-        f"✅ <b>Muvaffaqiyatli kirdingiz!</b>\n"
-        f"📅 Muddat: <b>{expires_str}</b> gacha",
-        parse_mode="HTML",
-        reply_markup=get_user_main_menu()
-    )
-    logger.info(f"Foydalanuvchi kirdi: telegram_id={telegram_id}")
-
-
-# ============================================================
-# BOSH MENYU
-# ============================================================
-
-@router.message(F.text == "🏠 Bosh menyuga qaytish")
-async def go_home(message: Message, state: FSMContext, session: AsyncSession):
-    """Bosh menyuga qaytish"""
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not user or is_expired(user.expires_at) or not user.is_active:
-        await clear_state(state)
-        await message.answer(
-            "⚠️ Davom etish uchun avval kiring.",
-            reply_markup=get_start_keyboard()
-        )
-        return
-    await message.answer(
-        "🏠 <b>Bosh menyu</b>",
-        reply_markup=get_user_main_menu(),
-        parse_mode="HTML"
+        "✅ Parol muvaffaqiyatli o'zgartirildi!",
+        reply_markup=user_main_menu()
     )

@@ -1,336 +1,330 @@
+"""
+E'lon yaratish va boshqarish
+— xabarlar foydalanuvchi ulagan Telegram akkauntidan yuboriladi
+— bot nomidan EMAS
+"""
+import asyncio
+import logging
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
-from loguru import logger
 
-from database.crud import (
-    get_user_by_telegram_id,
-    get_channels_by_user_id,
-    create_announcement,
-    get_announcement_by_id,
-    get_open_announcements_by_user,
-    get_closed_announcements_by_user,
-    close_announcement,
-    deactivate_channel,
-)
-from services.pyrogram_client import send_to_all_channels
+from database import crud
+from database.connection import AsyncSessionLocal
+from services.pyrogram_client import get_client, send_to_channel
 from utils.keyboards import (
-    get_announcement_confirm_keyboard,
-    get_close_announcement_keyboard,
-    get_my_announcements_menu,
-    get_open_announcements_keyboard,
-    get_closed_announcements_keyboard,
-    get_user_main_menu,
-    get_cancel_keyboard,
+    user_main_menu, announcements_menu,
+    close_announcement_keyboard,
+    save_cancel_keyboard
 )
-from utils.helpers import (
-    is_expired,
-    clear_state,
-    truncate_text,
-    format_datetime,
-)
-from handlers.user.states import AnnouncementStates
+from utils.helpers import truncate
+import config
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
-def _auth_check(user) -> bool:
-    return user and user.is_active and not is_expired(user.expires_at)
+class AnnouncementStates(StatesGroup):
+    waiting_text = State()
 
 
-# ============================================================
-# YANGI E'LON YARATISH
-# ============================================================
-
+# ─── Yangi e'lon yaratish ──────────────────────────────────────────────
 @router.message(F.text == "📝 Yangi e'lon yaratish")
-async def new_announcement_start(message: Message, state: FSMContext, session: AsyncSession):
-    await clear_state(state)
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
-        await message.answer("⚠️ Avval kiring.")
+async def new_announcement_start(message: Message, state: FSMContext,
+                                  db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
+        await message.answer("❌ Avval tizimga kiring.")
         return
 
-    channels = await get_channels_by_user_id(session, user.id)
+    # Foydalanuvchi Telegram akkauntini ulagan?
+    sess = await crud.get_session(db, user.id)
+    if not sess:
+        await message.answer(
+            "❌ Telegram akkauntingiz ulanmagan!\n\n"
+            "📱 Avval '📱 Telegram akkauntni ulash' bo'limiga o'ting.\n"
+            "Akkaunt ulanganidan keyin xabarlar sizning akkauntingizdan yuboriladi."
+        )
+        return
+
+    channels = await crud.get_user_channels(db, user.id)
     if not channels:
         await message.answer(
-            "📭 <b>Hali hech qanday kanal/guruh qo'shilmagan!</b>\n\n"
-            "Avval <b>📢 Guruh va kanallar</b> bo'limidan link qo'shing.",
-            parse_mode="HTML",
-            reply_markup=get_user_main_menu()
+            "❌ Hech qanday guruh/kanal qo'shilmagan!\n"
+            "📢 Avval '📢 Guruh va kanallar' bo'limidan qo'shing."
         )
         return
 
     await state.set_state(AnnouncementStates.waiting_text)
-    await state.update_data(user_id=user.id)
     await message.answer(
-        "📝 <b>Guruh va kanallarga yubormoqchi bo'lgan xabaringizni yozing:</b>",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard()
+        f"📝 E'lon matnini yozing:\n\n"
+        f"📊 {len(channels)} ta guruh/kanalga sizning akkauntingizdan yuboriladi\n"
+        f"⏱ Interval: {user.interval_minutes} daqiqa"
     )
 
 
 @router.message(AnnouncementStates.waiting_text)
-async def new_announcement_text(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await clear_state(state)
-        await message.answer("❌ Bekor qilindi.", reply_markup=get_user_main_menu())
+async def announcement_text(message: Message, state: FSMContext):
+    text = message.text.strip() if message.text else ""
+    if not text:
+        await message.answer("❌ E'lon matni bo'sh bo'lishi mumkin emas!")
         return
 
-    if not message.text or not message.text.strip():
-        await message.answer("❌ Xabar bo'sh bo'lmasligi kerak!")
-        return
-
-    text = message.text.strip()
-    await state.update_data(announcement_text=text)
-    await state.set_state(AnnouncementStates.confirm)
-
+    await state.update_data(text=text)
+    kb = save_cancel_keyboard("ann:send", "ann:cancel")
     await message.answer(
-        f"📋 <b>Quyidagi e'lonni yuborasizmi?</b>\n"
-        f"──────────────────\n"
+        f"📋 E'lon ko'rinishi:\n"
+        f"{'─' * 30}\n"
         f"{text}\n"
-        f"──────────────────",
-        reply_markup=get_announcement_confirm_keyboard(),
-        parse_mode="HTML"
+        f"{'─' * 30}\n\n"
+        f"✅ Yuborasizmi?",
+        reply_markup=kb
     )
 
 
-@router.callback_query(F.data == "cancel_announcement")
+@router.callback_query(F.data == "ann:cancel")
 async def cancel_announcement(callback: CallbackQuery, state: FSMContext):
-    await clear_state(state)
+    await state.clear()
     await callback.message.edit_text("❌ E'lon bekor qilindi.")
-    await callback.message.answer("🏠 Bosh menyu:", reply_markup=get_user_main_menu())
     await callback.answer()
 
 
-@router.callback_query(F.data == "send_announcement", AnnouncementStates.confirm)
-async def send_announcement_execute(
-    callback: CallbackQuery,
-    state: FSMContext,
-    session: AsyncSession,
-    bot: Bot
-):
+@router.callback_query(F.data == "ann:send")
+async def send_announcement(callback: CallbackQuery, state: FSMContext,
+                             db: AsyncSession, bot: Bot):
     data = await state.get_data()
-    user_id = data.get("user_id")
-    text = data.get("announcement_text", "")
-    await clear_state(state)
+    text = data.get("text", "")
+    tg_id = callback.from_user.id
 
-    user = await get_user_by_telegram_id(session, callback.from_user.id)
-    if not _auth_check(user):
-        await callback.answer("⚠️ Avval kiring!")
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
+        await callback.answer("❌ Xatolik!", show_alert=True)
         return
 
-    channels = await get_channels_by_user_id(session, user.id)
-    if not channels:
-        await callback.message.edit_text("📭 Kanallar topilmadi.")
-        return
+    await callback.message.edit_text("⏳ Yuborilmoqda...")
+    await state.clear()
 
-    await callback.message.edit_text("⏳ <b>Yuborilmoqda...</b>", parse_mode="HTML")
+    # E'lon bazaga saqlanadi
+    ann = await crud.create_announcement(db, user.id, text, user.interval_minutes)
+    await db.commit()
 
-    # Xabarlarni yuborish
-    success_count, fail_count, failed_channel_ids = await send_to_all_channels(
-        user_id=user.id,
-        channels=channels,
-        text=text,
-    )
-
-    # Muvaffaqiyatsiz kanallarni deaktiv qilish
-    if failed_channel_ids:
-        for ch_id in failed_channel_ids:
-            await deactivate_channel(session, ch_id)
-
-    # E'lonni bazaga saqlash
-    announcement = await create_announcement(
-        session,
-        user_id=user.id,
-        message_text=text,
-        interval_minutes=5,  # default
-    )
-
-    # Natija xabari
-    result_text = f"✅ <b>Yuborildi!</b>\n"
-    if fail_count > 0:
-        result_text += (
-            f"📤 {success_count} ta guruhga yetkazildi\n"
-            f"❌ {fail_count} ta guruhga yuborilmadi va o'chirildi"
-        )
-    else:
-        result_text += f"📤 {success_count} ta guruhga yetkazildi"
-
-    await callback.message.edit_text(result_text, parse_mode="HTML")
-
-    # Bot chatida e'lon + "Yuk ochiq" + Yopish tugmasi
-    preview = truncate_text(text, 200)
-    await bot.send_message(
-        callback.from_user.id,
-        f"📦 <b>Yuk ochiq</b>\n\n{preview}",
-        reply_markup=get_close_announcement_keyboard(announcement.id),
+    # Bot chatida e'lon kartasi — "Yuk ochiq" + Yopish tugmasi
+    sent_msg = await bot.send_message(
+        tg_id,
+        f"📦 <b>Yuk ochiq</b>\n\n{text}",
+        reply_markup=close_announcement_keyboard(ann.id),
         parse_mode="HTML"
     )
+    await crud.save_announcement_message_id(db, ann.id, sent_msg.message_id)
+    await db.commit()
 
-    # Bosh menyuga qaytish
+    # Fon vazifasi — guruh/kanallarga foydalanuvchi akkauntidan yuborish
+    user_data = {
+        "id": user.id,
+        "telegram_id": user.telegram_id,
+        "interval_minutes": user.interval_minutes,
+    }
+    asyncio.create_task(
+        _send_from_user_account(bot, user_data, ann.id, text)
+    )
+
+    await callback.message.edit_text("✅ E'lon yaratildi!")
     await bot.send_message(
-        callback.from_user.id,
-        "🏠 <b>Bosh menyu</b>",
-        reply_markup=get_user_main_menu(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-    logger.info(
-        f"E'lon yuborildi: user={user.id}, "
-        f"success={success_count}, fail={fail_count}"
+        tg_id,
+        "🏠 Bosh menyu:",
+        reply_markup=user_main_menu()
     )
 
 
-# ============================================================
-# E'LONNI YOPISH (inline tugma)
-# ============================================================
+async def _send_from_user_account(bot: Bot, user_data: dict,
+                                   ann_id: int, text: str):
+    """
+    Foydalanuvchi ulagan Telegram akkauntidan guruh/kanallarga yuboradi.
+    Bot nomidan EMAS — foydalanuvchi o'z akkauntidan yozadi.
+    """
+    async with AsyncSessionLocal() as db:
+        try:
+            user_id = user_data["id"]
+            tg_id = user_data["telegram_id"]
 
-@router.callback_query(F.data.startswith("close_ann_"))
-async def close_announcement_callback(
-    callback: CallbackQuery,
-    session: AsyncSession
-):
-    ann_id = int(callback.data.split("_")[-1])
-    announcement = await get_announcement_by_id(session, ann_id)
+            # Foydalanuvchi session (Telegram akkaunt)
+            sess_str = await crud.get_session(db, user_id)
+            if not sess_str:
+                logger.warning(f"User {user_id}: session topilmadi")
+                await bot.send_message(
+                    tg_id,
+                    "❌ Telegram akkauntingiz ulanmagan! E'lon yuborilmadi."
+                )
+                return
 
-    if not announcement:
-        await callback.answer("❌ E'lon topilmadi!")
+            # Foydalanuvchi akkauntining Pyrogram clienti
+            client = await get_client(user_id, sess_str)
+            if not client:
+                logger.error(f"User {user_id}: Pyrogram client yaratilmadi")
+                await bot.send_message(
+                    tg_id,
+                    "❌ Telegram akkauntga ulanib bo'lmadi. "
+                    "Sozlamalardan qayta ulang."
+                )
+                return
+
+            # Guruh/kanallar ro'yhati
+            channels = await crud.get_user_channels(db, user_id)
+            if not channels:
+                return
+
+            sent_count = 0
+            failed_count = 0
+            failed_ch_ids = []
+
+            # Har bir guruh/kanalga foydalanuvchi akkauntidan yuborish
+            for ch in channels:
+                success, reason = await send_to_channel(client, ch.link, text)
+
+                if success:
+                    sent_count += 1
+                    await crud.add_send_log(db, ann_id, ch.id, True)
+                    logger.info(
+                        f"✅ User {user_id} akkauntidan {ch.link} ga yuborildi"
+                    )
+                else:
+                    failed_count += 1
+                    failed_ch_ids.append(ch.id)
+                    await crud.add_send_log(db, ann_id, ch.id, False, reason)
+                    logger.warning(
+                        f"❌ User {user_id} — {ch.link}: {reason}"
+                    )
+
+                # Flood limit oldini olish
+                await asyncio.sleep(config.SESSION_SEND_DELAY)
+
+            # Kirish imkoni yo'q kanallarni o'chirish
+            for ch_id in failed_ch_ids:
+                await crud.deactivate_channel(db, ch_id)
+
+            await crud.update_last_sent(db, ann_id)
+            await db.commit()
+
+            # Natija xabari
+            msg_parts = [f"📊 <b>Yuborish natijasi:</b>"]
+            msg_parts.append(f"✅ {sent_count} ta guruhga yetkazildi")
+            if failed_count > 0:
+                msg_parts.append(
+                    f"❌ {failed_count} ta guruh o'chirildi "
+                    f"(akkauntingiz a'zo emas yoki yozish huquqi yo'q)"
+                )
+            await bot.send_message(tg_id, "\n".join(msg_parts),
+                                   parse_mode="HTML")
+
+        except Exception as e:
+            logger.error(f"_send_from_user_account xatosi: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+
+# ─── E'lon yopish ──────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("ann:close:"))
+async def close_announcement_cb(callback: CallbackQuery, db: AsyncSession):
+    ann_id = int(callback.data.split(":")[2])
+    tg_id = callback.from_user.id
+
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
+        await callback.answer("❌ Xatolik!", show_alert=True)
         return
 
-    user = await get_user_by_telegram_id(session, callback.from_user.id)
-    if not user or announcement.user_id != user.id:
-        await callback.answer("⛔ Ruxsat yo'q!")
+    ann = await crud.get_announcement_by_id(db, ann_id)
+    if not ann or ann.user_id != user.id:
+        await callback.answer("❌ E'lon topilmadi!", show_alert=True)
         return
 
-    if announcement.status == "closed":
-        await callback.answer("ℹ️ E'lon allaqachon yopilgan!")
-        return
+    await crud.close_announcement(db, ann_id)
+    await db.commit()
 
-    await close_announcement(session, ann_id)
+    # Bot chatidagi xabarni tahrirlash
+    try:
+        original = callback.message.text or ""
+        new_text = original.replace("📦 Yuk ochiq", "🔒 Yuk yopildi")
+        if new_text == original:
+            new_text = "🔒 Yuk yopildi\n\n" + original
+        await callback.message.edit_text(new_text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Xabarni tahrirlashda xato: {e}")
 
-    # Xabardagi matnni tahrirlash
-    original_text = callback.message.text or ""
-    # "📦 Yuk ochiq" ni "🔒 Yuk yopildi" ga almashtirish
-    new_text = original_text.replace("📦 Yuk ochiq", "🔒 Yuk yopildi")
-
-    await callback.message.edit_text(new_text, parse_mode="HTML")
-    await callback.answer("✅ E'lon yopildi!")
-    logger.info(f"E'lon yopildi: id={ann_id}, user={user.id}")
+    await callback.answer("✅ E'lon yopildi! Yuborish to'xtatildi.")
 
 
-# ============================================================
-# MENING E'LONLARIM
-# ============================================================
-
+# ─── Mening e'lonlarim ─────────────────────────────────────────────────
 @router.message(F.text == "📋 Mening e'lonlarim")
-async def my_announcements_menu(message: Message, state: FSMContext, session: AsyncSession):
-    await clear_state(state)
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
-        await message.answer("⚠️ Avval kiring.")
+async def my_announcements(message: Message, db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
         return
-
-    await message.answer(
-        "📋 <b>Mening e'lonlarim</b>",
-        reply_markup=get_my_announcements_menu(),
-        parse_mode="HTML"
-    )
+    await message.answer("📋 E'lonlarim:", reply_markup=announcements_menu())
 
 
 @router.message(F.text == "📢 Ochiq e'lonlarim")
-async def open_announcements_list(message: Message, session: AsyncSession):
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
+async def open_announcements(message: Message, db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
         return
 
-    announcements = await get_open_announcements_by_user(session, user.id)
-    if not announcements:
+    anns = await crud.get_user_open_announcements(db, user.id)
+    if not anns:
         await message.answer(
-            "📭 <b>Ochiq e'lonlar yo'q.</b>",
-            parse_mode="HTML",
-            reply_markup=get_my_announcements_menu()
+            "📭 Hozirda ochiq e'lonlar yo'q.",
+            reply_markup=announcements_menu()
         )
         return
 
+    for ann in anns:
+        await message.answer(
+            f"📢 E'lon #{ann.id}\n"
+            f"📝 {truncate(ann.message_text, 100)}\n"
+            f"⏱ Har {ann.interval_minutes} daqiqada yuboriladi\n"
+            f"📅 {ann.created_at.strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=close_announcement_keyboard(ann.id)
+        )
+
     await message.answer(
-        f"📢 <b>Ochiq e'lonlaringiz ({len(announcements)} ta):</b>",
-        reply_markup=get_open_announcements_keyboard(announcements),
-        parse_mode="HTML"
+        f"📊 Jami {len(anns)} ta ochiq e'lon",
+        reply_markup=announcements_menu()
     )
 
 
 @router.message(F.text == "🔒 Yopilgan e'lonlarim")
-async def closed_announcements_list(message: Message, session: AsyncSession):
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
+async def closed_announcements(message: Message, db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
         return
 
-    announcements = await get_closed_announcements_by_user(session, user.id)
-    if not announcements:
+    anns = await crud.get_user_closed_announcements(db, user.id)
+    if not anns:
         await message.answer(
-            "📭 <b>Yopilgan e'lonlar yo'q.</b>",
-            parse_mode="HTML",
-            reply_markup=get_my_announcements_menu()
+            "📭 Yopilgan e'lonlar yo'q.",
+            reply_markup=announcements_menu()
         )
         return
 
-    await message.answer(
-        f"🔒 <b>Yopilgan e'lonlaringiz ({len(announcements)} ta):</b>",
-        reply_markup=get_closed_announcements_keyboard(announcements),
-        parse_mode="HTML"
-    )
-
-
-@router.callback_query(F.data == "my_ann_back")
-async def my_ann_back_callback(callback: CallbackQuery):
-    await callback.message.delete()
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ann_preview_"))
-async def open_ann_preview(callback: CallbackQuery, session: AsyncSession):
-    ann_id = int(callback.data.split("_")[-1])
-    ann = await get_announcement_by_id(session, ann_id)
-    if not ann:
-        await callback.answer("❌ Topilmadi!")
-        return
-    await callback.answer(
-        f"📝 {truncate_text(ann.message_text, 200)}",
-        show_alert=True
-    )
-
-
-@router.callback_query(F.data.startswith("closed_ann_preview_"))
-async def closed_ann_preview(callback: CallbackQuery, session: AsyncSession):
-    ann_id = int(callback.data.split("_")[-1])
-    ann = await get_announcement_by_id(session, ann_id)
-    if not ann:
-        await callback.answer("❌ Topilmadi!")
-        return
-    closed_at = format_datetime(ann.closed_at) if ann.closed_at else "Noma'lum"
-    await callback.answer(
-        f"🔒 Yopildi: {closed_at}\n\n{truncate_text(ann.message_text, 150)}",
-        show_alert=True
-    )
-
-
-# ============================================================
-# ADMIN BILAN BOG'LANISH
-# ============================================================
-
-@router.message(F.text == "📞 Admin bilan bog'lanish")
-async def admin_contact(message: Message, session: AsyncSession):
-    from database.crud import get_first_admin
-    admin = await get_first_admin(session)
-    if not admin:
-        await message.answer("❌ Admin ma'lumotlari topilmadi.")
-        return
+    for ann in anns:
+        closed_time = (ann.closed_at.strftime('%d.%m.%Y %H:%M')
+                       if ann.closed_at else "—")
+        await message.answer(
+            f"🔒 E'lon #{ann.id}\n"
+            f"📝 {truncate(ann.message_text, 100)}\n"
+            f"🕐 Yopilgan: {closed_time}"
+        )
 
     await message.answer(
-        "📞 <b>Admin bilan bog'lanish:</b>\n\n"
-        f"📱 <b>Telefon:</b> {admin.phone or 'Mavjud emas'}\n"
-        f"💬 <b>Telegram:</b> @{admin.username or 'Mavjud emas'}",
-        parse_mode="HTML",
-        reply_markup=get_user_main_menu()
+        f"📊 Jami {len(anns)} ta yopilgan e'lon\n"
+        f"⚠️ Bugun yarim tunda avtomatik o'chiriladi",
+        reply_markup=announcements_menu()
     )

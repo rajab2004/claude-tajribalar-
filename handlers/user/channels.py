@@ -1,249 +1,170 @@
+"""
+Guruh va kanallar boshqaruvi
+"""
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.crud import (
-    get_user_by_telegram_id,
-    get_channels_by_user_id,
-    count_user_channels,
-    add_channel,
-    delete_channel,
-    get_channel_by_id,
-)
+from database import crud
 from utils.keyboards import (
-    get_channels_menu,
-    get_channels_list_keyboard,
-    get_channel_delete_confirm,
-    get_user_main_menu,
-    get_cancel_keyboard,
+    channels_menu, user_main_menu,
+    save_cancel_keyboard, InlineKeyboardBuilder
 )
-from utils.helpers import (
-    is_valid_telegram_link,
-    normalize_link,
-    is_expired,
-    clear_state,
-)
-from handlers.user.states import ChannelStates
+from utils.helpers import is_valid_channel_link
+import config
 
 router = Router()
 
-MAX_CHANNELS = 150
 
+class ChannelStates(StatesGroup):
+    waiting_link = State()
 
-def _auth_check(user) -> bool:
-    return user and user.is_active and not is_expired(user.expires_at)
-
-
-# ============================================================
-# KANALLAR MENYUSI
-# ============================================================
 
 @router.message(F.text == "📢 Guruh va kanallar")
-async def channels_menu(message: Message, state: FSMContext, session: AsyncSession):
-    await clear_state(state)
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
-        await message.answer("⚠️ Avval kiring.", reply_markup=__import__("utils.keyboards", fromlist=["get_start_keyboard"]).get_start_keyboard())
+async def channels_menu_handler(message: Message, state: FSMContext,
+                                 db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
+        await message.answer("❌ Avval tizimga kiring.")
         return
 
-    count = await count_user_channels(session, user.id)
+    channels = await crud.get_user_channels(db, user.id)
     await message.answer(
-        f"📢 <b>Guruh va kanallar</b>\n"
-        f"Qo'shilgan linklar: <b>{count}</b> / {MAX_CHANNELS}",
-        reply_markup=get_channels_menu(),
-        parse_mode="HTML"
+        f"📢 Guruh va Kanallar\n"
+        f"📊 Qo'shilgan: {len(channels)}/{config.MAX_CHANNELS}",
+        reply_markup=channels_menu()
     )
 
 
-# ============================================================
-# YANGI LINK QO'SHISH
-# ============================================================
-
 @router.message(F.text == "➕ Yangi link qo'shish")
-async def add_channel_start(message: Message, state: FSMContext, session: AsyncSession):
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
+async def add_channel_start(message: Message, state: FSMContext,
+                             db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
         return
 
-    count = await count_user_channels(session, user.id)
-    if count >= MAX_CHANNELS:
+    channels = await crud.get_user_channels(db, user.id)
+    if len(channels) >= config.MAX_CHANNELS:
         await message.answer(
-            f"🚫 <b>Maksimal {MAX_CHANNELS} ta link qo'shish mumkin.</b>\n"
-            "Avval eskisini o'chiring.",
-            parse_mode="HTML"
+            f"❌ Maksimal {config.MAX_CHANNELS} ta link qo'shish mumkin!\n"
+            "Avval eskisini o'chiring."
         )
         return
 
     await state.set_state(ChannelStates.waiting_link)
-    await state.update_data(user_id=user.id)
     await message.answer(
-        "🔗 <b>E'lon tashlash uchun guruh/kanal linkini kiriting:</b>\n\n"
-        "Qabul qilinadigan formatlar:\n"
-        "• <code>https://t.me/username</code>\n"
-        "• <code>https://t.me/+hashcode</code>\n"
-        "• <code>@username</code>",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard()
+        "🔗 Guruh yoki kanal linkini kiriting:\n\n"
+        "📌 Format: https://t.me/guruhadi yoki @guruhadi\n\n"
+        "⚠️ <b>Muhim eslatma:</b>\n"
+        "Xabarlar <b>sizning Telegram akkauntingizdan</b> yuboriladi.\n"
+        "Shuning uchun:\n"
+        "  • Siz o'sha guruh/kanalga a'zo bo'lishingiz kerak\n"
+        "  • Guruhda yozish imkoniyati cheklanmagan bo'lishi kerak\n"
+        "  • Guruhda siz muzlatilmagan bo'lishingiz kerak\n\n"
+        "🤖 Bot guruhda admin bo'lishi shart emas!",
+        parse_mode="HTML"
     )
 
 
 @router.message(ChannelStates.waiting_link)
-async def add_channel_link(message: Message, state: FSMContext, session: AsyncSession):
-    if message.text == "❌ Bekor qilish":
-        await clear_state(state)
-        await message.answer("❌ Bekor qilindi.", reply_markup=get_channels_menu())
-        return
-
-    link = message.text.strip() if message.text else ""
-
-    if not is_valid_telegram_link(link):
+async def add_channel_link(message: Message, state: FSMContext):
+    link = message.text.strip()
+    if not is_valid_channel_link(link):
         await message.answer(
-            "❌ <b>Noto'g'ri format!</b> Qayta kiriting.\n\n"
-            "Misol: <code>https://t.me/username</code> yoki <code>@username</code>",
-            parse_mode="HTML"
+            "❌ Noto'g'ri link formati!\n"
+            "Format: https://t.me/guruhadi yoki @guruhadi"
         )
         return
 
-    link = normalize_link(link)
+    await state.update_data(link=link)
+    kb = save_cancel_keyboard("ch:save", "ch:cancel")
+    await message.answer(
+        f"🔗 Link: <code>{link}</code>\n\n"
+        f"Saqlaysizmi?",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "ch:save")
+async def save_channel(callback: CallbackQuery, state: FSMContext,
+                        db: AsyncSession):
     data = await state.get_data()
-    user_id = data.get("user_id")
+    tg_id = callback.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
 
-    count = await count_user_channels(session, user_id)
-    if count >= MAX_CHANNELS:
-        await clear_state(state)
-        await message.answer(
-            f"🚫 Maksimal {MAX_CHANNELS} ta limit to'ldi.",
-            reply_markup=get_channels_menu()
-        )
-        return
+    ch = await crud.add_channel(db, user.id, data["link"])
+    await db.commit()
+    await state.clear()
 
-    channel = await add_channel(session, user_id, link)
-    await clear_state(state)
-
-    if channel:
-        await message.answer(
-            f"✅ <b>Link muvaffaqiyatli qo'shildi!</b>\n\n"
-            f"⚠️ <i>Diqqat: Bot guruhda/kanalda xabar yuborish huquqiga ega bo'lishi "
-            f"va cheklanmagan/muzlatilmagan bo'lishi kerak!</i>",
-            parse_mode="HTML",
-            reply_markup=get_channels_menu()
+    if ch is None:
+        await callback.message.edit_text(
+            f"❌ Maksimal {config.MAX_CHANNELS} ta limit!"
         )
     else:
-        await message.answer(
-            "❌ Link qo'shishda xato yuz berdi.",
-            reply_markup=get_channels_menu()
+        await callback.message.edit_text(
+            f"✅ Link muvaffaqiyatli qo'shildi!\n🔗 {data['link']}"
         )
+    await callback.answer()
 
 
-# ============================================================
-# BARCHA LINKLARNI KO'RISH
-# ============================================================
+@router.callback_query(F.data == "ch:cancel")
+async def cancel_channel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Bekor qilindi.")
+    await callback.answer()
+
 
 @router.message(F.text == "📋 Barcha linklarni ko'rish")
-async def list_channels(message: Message, state: FSMContext, session: AsyncSession):
-    await clear_state(state)
-    user = await get_user_by_telegram_id(session, message.from_user.id)
-    if not _auth_check(user):
+async def list_channels(message: Message, db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
         return
 
-    channels = await get_channels_by_user_id(session, user.id)
+    channels = await crud.get_user_channels(db, user.id)
     if not channels:
         await message.answer(
-            "📭 <b>Hali hech qanday link qo'shilmagan.</b>",
-            parse_mode="HTML",
-            reply_markup=get_channels_menu()
+            "📭 Hech qanday link qo'shilmagan.\n"
+            "➕ Yangi link qo'shing.",
+            reply_markup=channels_menu()
         )
         return
+
+    for ch in channels:
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text="🗑 O'chirish",
+            callback_data=f"ch:del:{ch.id}"
+        )
+        await message.answer(
+            f"🔗 {ch.link}\n"
+            f"📅 {ch.added_at.strftime('%d.%m.%Y')}",
+            reply_markup=builder.as_markup()
+        )
 
     await message.answer(
-        f"📋 <b>Sizning linklaringiz ({len(channels)} ta):</b>",
-        reply_markup=get_channels_list_keyboard(channels),
-        parse_mode="HTML"
+        f"📊 Jami: {len(channels)}/{config.MAX_CHANNELS} ta",
+        reply_markup=channels_menu()
     )
 
 
-@router.callback_query(F.data == "channels_list")
-async def channels_list_callback(callback: CallbackQuery, session: AsyncSession):
-    user = await get_user_by_telegram_id(session, callback.from_user.id)
-    if not _auth_check(user):
-        await callback.answer("⚠️ Avval kiring!")
-        return
-
-    channels = await get_channels_by_user_id(session, user.id)
-    if not channels:
-        await callback.message.edit_text("📭 Hali hech qanday link yo'q.")
-        return
-
-    await callback.message.edit_text(
-        f"📋 <b>Sizning linklaringiz ({len(channels)} ta):</b>",
-        reply_markup=get_channels_list_keyboard(channels),
-        parse_mode="HTML"
-    )
-    await callback.answer()
+@router.callback_query(F.data.startswith("ch:del:"))
+async def delete_channel_cb(callback: CallbackQuery, db: AsyncSession):
+    ch_id = int(callback.data.split(":")[2])
+    tg_id = callback.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    await crud.delete_channel(db, ch_id, user.id)
+    await db.commit()
+    await callback.message.edit_text("🗑 Link o'chirildi.")
+    await callback.answer("✅ O'chirildi")
 
 
-@router.callback_query(F.data == "channels_back")
-async def channels_back_callback(callback: CallbackQuery):
-    await callback.message.delete()
-    await callback.answer()
-
-
-# ============================================================
-# KANALNI O'CHIRISH
-# ============================================================
-
-@router.callback_query(F.data.startswith("delete_channel_"))
-async def delete_channel_confirm(callback: CallbackQuery, session: AsyncSession):
-    channel_id = int(callback.data.split("_")[-1])
-    channel = await get_channel_by_id(session, channel_id)
-
-    if not channel:
-        await callback.answer("❌ Kanal topilmadi!")
-        return
-
-    # Ownership tekshiruvi
-    user = await get_user_by_telegram_id(session, callback.from_user.id)
-    if not user or channel.user_id != user.id:
-        await callback.answer("⛔ Ruxsat yo'q!")
-        return
-
-    link_text = channel.link if len(channel.link) <= 40 else channel.link[:37] + "..."
-    await callback.message.edit_text(
-        f"🗑 <b>Rostdan o'chirmoqchimisiz?</b>\n\n"
-        f"🔗 {link_text}",
-        reply_markup=get_channel_delete_confirm(channel_id),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("confirm_delete_channel_"))
-async def delete_channel_execute(callback: CallbackQuery, session: AsyncSession):
-    channel_id = int(callback.data.split("_")[-1])
-    channel = await get_channel_by_id(session, channel_id)
-
-    if not channel:
-        await callback.answer("❌ Kanal topilmadi!")
-        return
-
-    user = await get_user_by_telegram_id(session, callback.from_user.id)
-    if not user or channel.user_id != user.id:
-        await callback.answer("⛔ Ruxsat yo'q!")
-        return
-
-    await delete_channel(session, channel_id)
-
-    channels = await get_channels_by_user_id(session, user.id)
-    if channels:
-        await callback.message.edit_text(
-            f"✅ Link o'chirildi!\n\n"
-            f"📋 <b>Qolgan linklaringiz ({len(channels)} ta):</b>",
-            reply_markup=get_channels_list_keyboard(channels),
-            parse_mode="HTML"
-        )
-    else:
-        await callback.message.edit_text(
-            "✅ Link o'chirildi!\n\n📭 Linklaringiz yo'q."
-        )
-    await callback.answer("✅ O'chirildi!")
+@router.message(F.text == "🏠 Bosh menyu")
+async def back_to_main(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🏠 Bosh menyu:", reply_markup=user_main_menu())

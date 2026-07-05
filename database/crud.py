@@ -1,696 +1,482 @@
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-from sqlalchemy import select, update, delete, func, and_
+"""
+CRUD operatsiyalar — barcha database amallar shu yerda
+"""
+from datetime import datetime, timedelta
+from typing import Optional, List
+from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from loguru import logger
+from sqlalchemy.orm import selectinload
 
-from database.models import Admin, User, Session, Channel, Announcement, SendLog
+from database.models import (
+    Admin, User, UserSession, Channel,
+    Announcement, SendLog, AnnouncementStatus
+)
+from services.crypto import hash_password, verify_password, encrypt_text, decrypt_text
+import config
 
 
-# ============================================================
-# ADMIN CRUD
-# ============================================================
+# ═══════════════════════════════════════════════════════
+#  ADMIN CRUD
+# ═══════════════════════════════════════════════════════
 
-async def get_admin_by_telegram_id(session: AsyncSession, telegram_id: int) -> Optional[Admin]:
-    """Telegram ID bo'yicha admin topish"""
-    result = await session.execute(
+async def get_admin_by_telegram_id(db: AsyncSession, telegram_id: int) -> Optional[Admin]:
+    result = await db.execute(
         select(Admin).where(Admin.telegram_id == telegram_id)
     )
     return result.scalar_one_or_none()
 
 
-async def get_admin_by_id(session: AsyncSession, admin_id: int) -> Optional[Admin]:
-    """ID bo'yicha admin topish"""
-    result = await session.execute(
-        select(Admin).where(Admin.id == admin_id)
-    )
-    return result.scalar_one_or_none()
-
-
-async def create_admin(
-    session: AsyncSession,
-    telegram_id: int,
-    password_hash: str,
-    gmail: str = None,
-    phone: str = None,
-    username: str = None
-) -> Admin:
-    """Yangi admin yaratish"""
+async def create_admin(db: AsyncSession) -> Admin:
+    """Birinchi marta ishga tushganda admin yaratiladi"""
+    existing = await get_admin_by_telegram_id(db, config.ADMIN_TELEGRAM_ID)
+    if existing:
+        return existing
     admin = Admin(
-        telegram_id=telegram_id,
-        password_hash=password_hash,
-        gmail=gmail,
-        phone=phone,
-        username=username,
+        telegram_id=config.ADMIN_TELEGRAM_ID,
+        password_hash=hash_password(config.ADMIN_PASSWORD),
+        gmail=config.ADMIN_GMAIL,
+        phone=config.ADMIN_PHONE,
+        username=config.ADMIN_USERNAME,
     )
-    session.add(admin)
-    await session.flush()
-    await session.refresh(admin)
-    logger.info(f"Yangi admin yaratildi: {telegram_id}")
+    db.add(admin)
+    await db.flush()
     return admin
 
 
-async def update_admin_password(
-    session: AsyncSession,
-    admin_id: int,
-    new_password_hash: str
-) -> bool:
-    """Admin parolini yangilash"""
-    result = await session.execute(
-        update(Admin)
-        .where(Admin.id == admin_id)
-        .values(password_hash=new_password_hash, wrong_attempts=0)
-    )
-    return result.rowcount > 0
-
-
-async def update_admin_gmail(
-    session: AsyncSession,
-    admin_id: int,
-    new_gmail: str
-) -> bool:
-    """Admin Gmail manzilini yangilash"""
-    result = await session.execute(
-        update(Admin)
-        .where(Admin.id == admin_id)
-        .values(gmail=new_gmail)
-    )
-    return result.rowcount > 0
-
-
-async def update_admin_contact(
-    session: AsyncSession,
-    admin_id: int,
-    phone: str = None,
-    username: str = None
-) -> bool:
-    """Admin bog'lanish ma'lumotlarini yangilash"""
-    values = {}
-    if phone is not None:
-        values["phone"] = phone
-    if username is not None:
-        values["username"] = username
-    if not values:
-        return False
-    result = await session.execute(
-        update(Admin).where(Admin.id == admin_id).values(**values)
-    )
-    return result.rowcount > 0
-
-
-async def increment_admin_wrong_attempts(
-    session: AsyncSession,
-    telegram_id: int
-) -> int:
-    """Admin noto'g'ri urinishlar sonini oshirish, yangi qiymatni qaytarish"""
-    result = await session.execute(
-        select(Admin).where(Admin.telegram_id == telegram_id)
-    )
-    admin = result.scalar_one_or_none()
+async def verify_admin_password(db: AsyncSession, telegram_id: int,
+                                 password: str) -> tuple[bool, Admin | None]:
+    """
+    Returns: (success, admin_obj)
+    """
+    admin = await get_admin_by_telegram_id(db, telegram_id)
     if not admin:
-        return 0
-    admin.wrong_attempts += 1
-    await session.flush()
-    return admin.wrong_attempts
+        return False, None
+    if verify_password(password, admin.password_hash):
+        # Reset wrong attempts
+        await db.execute(
+            update(Admin).where(Admin.id == admin.id)
+            .values(wrong_attempts=0)
+        )
+        return True, admin
+    else:
+        new_attempts = admin.wrong_attempts + 1
+        await db.execute(
+            update(Admin).where(Admin.id == admin.id)
+            .values(wrong_attempts=new_attempts)
+        )
+        await db.refresh(admin)
+        admin.wrong_attempts = new_attempts
+        return False, admin
 
 
-async def reset_admin_wrong_attempts(
-    session: AsyncSession,
-    telegram_id: int
-) -> None:
-    """Admin noto'g'ri urinishlarini nolga qaytarish"""
-    await session.execute(
-        update(Admin)
-        .where(Admin.telegram_id == telegram_id)
-        .values(wrong_attempts=0)
+async def update_admin_password(db: AsyncSession, admin_id: int,
+                                 new_password: str):
+    await db.execute(
+        update(Admin).where(Admin.id == admin_id)
+        .values(password_hash=hash_password(new_password), wrong_attempts=0)
     )
 
 
-async def get_first_admin(session: AsyncSession) -> Optional[Admin]:
-    """Birinchi (asosiy) adminni olish"""
-    result = await session.execute(
-        select(Admin).order_by(Admin.id.asc()).limit(1)
+async def update_admin_info(db: AsyncSession, admin_id: int, **kwargs):
+    await db.execute(
+        update(Admin).where(Admin.id == admin_id).values(**kwargs)
     )
-    return result.scalar_one_or_none()
 
 
-# ============================================================
-# USER CRUD
-# ============================================================
+# ═══════════════════════════════════════════════════════
+#  USER CRUD
+# ═══════════════════════════════════════════════════════
 
-async def get_user_by_telegram_id(
-    session: AsyncSession,
-    telegram_id: int
-) -> Optional[User]:
-    """Telegram ID bo'yicha foydalanuvchi topish"""
-    result = await session.execute(
-        select(User).where(User.telegram_id == telegram_id)
-    )
-    return result.scalar_one_or_none()
-
-
-async def get_user_by_id(session: AsyncSession, user_id: int) -> Optional[User]:
-    """ID bo'yicha foydalanuvchi topish"""
-    result = await session.execute(
-        select(User).where(User.id == user_id)
-    )
-    return result.scalar_one_or_none()
-
-
-async def create_user(
-    session: AsyncSession,
-    telegram_id: int,
-    password_hash: str,
-    months: int,
-    phone: str = None,
-    admin_id: int = None
-) -> User:
-    """Yangi foydalanuvchi yaratish"""
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30 * months)
+async def create_user(db: AsyncSession, telegram_id: int, phone: str,
+                       password: str, months: int,
+                       admin_id: int) -> tuple[User, str]:
+    """
+    Returns: (user, plain_password)
+    """
+    expires_at = datetime.utcnow() + timedelta(days=30 * months)
     user = User(
         telegram_id=telegram_id,
-        password_hash=password_hash,
         phone=phone,
-        is_active=True,
+        password_hash=hash_password(password),
         expires_at=expires_at,
         created_by=admin_id,
     )
-    session.add(user)
-    await session.flush()
-    await session.refresh(user)
-    logger.info(f"Yangi foydalanuvchi yaratildi: {telegram_id}, muddat: {months} oy")
+    db.add(user)
+    await db.flush()
     return user
 
 
-async def update_user_password(
-    session: AsyncSession,
-    user_id: int,
-    new_password_hash: str
-) -> bool:
-    """Foydalanuvchi parolini yangilash"""
-    result = await session.execute(
-        update(User)
-        .where(User.id == user_id)
-        .values(password_hash=new_password_hash, wrong_attempts=0)
-    )
-    return result.rowcount > 0
-
-
-async def increment_user_wrong_attempts(
-    session: AsyncSession,
-    telegram_id: int
-) -> int:
-    """Foydalanuvchi noto'g'ri urinishlar sonini oshirish"""
-    result = await session.execute(
-        select(User).where(User.telegram_id == telegram_id)
-    )
-    user = result.scalar_one_or_none()
-    if not user:
-        return 0
-    user.wrong_attempts += 1
-    await session.flush()
-    return user.wrong_attempts
-
-
-async def reset_user_wrong_attempts(
-    session: AsyncSession,
-    telegram_id: int
-) -> None:
-    """Foydalanuvchi noto'g'ri urinishlarini nolga qaytarish"""
-    await session.execute(
-        update(User)
+async def get_user_by_telegram_id(db: AsyncSession,
+                                   telegram_id: int) -> Optional[User]:
+    result = await db.execute(
+        select(User)
         .where(User.telegram_id == telegram_id)
-        .values(wrong_attempts=0)
+        .options(selectinload(User.session))
     )
+    return result.scalar_one_or_none()
 
 
-async def deactivate_user(session: AsyncSession, user_id: int) -> bool:
-    """Foydalanuvchini deaktiv qilish"""
-    result = await session.execute(
-        update(User)
-        .where(User.id == user_id)
-        .values(is_active=False)
+async def get_user_by_id(db: AsyncSession, user_id: int) -> Optional[User]:
+    result = await db.execute(
+        select(User).where(User.id == user_id)
+        .options(selectinload(User.session))
     )
-    return result.rowcount > 0
+    return result.scalar_one_or_none()
 
 
-async def extend_user_expiry(
-    session: AsyncSession,
-    user_id: int,
-    months: int
-) -> Optional[datetime]:
-    """Foydalanuvchi muddatini uzaytirish"""
-    user = await get_user_by_id(session, user_id)
+async def verify_user_password(db: AsyncSession, telegram_id: int,
+                                password: str) -> tuple[bool, User | None]:
+    user = await get_user_by_telegram_id(db, telegram_id)
     if not user:
-        return None
+        return False, None
+    if not user.is_active:
+        return False, user
+    if user.expires_at < datetime.utcnow():
+        return False, user
+    if verify_password(password, user.password_hash):
+        await db.execute(
+            update(User).where(User.id == user.id)
+            .values(wrong_attempts=0)
+        )
+        return True, user
+    else:
+        new_attempts = user.wrong_attempts + 1
+        await db.execute(
+            update(User).where(User.id == user.id)
+            .values(wrong_attempts=new_attempts)
+        )
+        await db.refresh(user)
+        user.wrong_attempts = new_attempts
+        return False, user
 
-    now = datetime.now(timezone.utc)
-    # Agar muddat o'tgan bo'lsa, hozirdan boshlab hisoblash
-    base = user.expires_at if user.expires_at and user.expires_at > now else now
-    new_expires = base + timedelta(days=30 * months)
 
-    await session.execute(
-        update(User)
-        .where(User.id == user_id)
-        .values(expires_at=new_expires, is_active=True)
+async def update_user_password(db: AsyncSession, user_id: int,
+                                new_password: str):
+    await db.execute(
+        update(User).where(User.id == user_id)
+        .values(password_hash=hash_password(new_password), wrong_attempts=0)
     )
-    logger.info(f"User {user_id} muddati {months} oyga uzaytirildi: {new_expires}")
-    return new_expires
 
 
-async def delete_user(session: AsyncSession, user_id: int) -> bool:
-    """Foydalanuvchini o'chirish (cascade: session, channel, announcement ham o'chadi)"""
-    result = await session.execute(
-        delete(User).where(User.id == user_id)
+async def extend_user_expiry(db: AsyncSession, user_id: int, months: int):
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        return
+    base = max(user.expires_at, datetime.utcnow())
+    new_expiry = base + timedelta(days=30 * months)
+    await db.execute(
+        update(User).where(User.id == user_id)
+        .values(expires_at=new_expiry, is_active=True, wrong_attempts=0)
     )
-    logger.info(f"Foydalanuvchi o'chirildi: {user_id}")
-    return result.rowcount > 0
 
 
-async def get_all_users(session: AsyncSession) -> list[User]:
-    """Barcha foydalanuvchilarni olish"""
-    result = await session.execute(
-        select(User).order_by(User.created_at.desc())
+async def deactivate_user(db: AsyncSession, user_id: int):
+    await db.execute(
+        update(User).where(User.id == user_id).values(is_active=False)
     )
+
+
+async def delete_user(db: AsyncSession, user_id: int):
+    await db.execute(delete(User).where(User.id == user_id))
+
+
+async def get_all_users(db: AsyncSession) -> List[User]:
+    result = await db.execute(select(User).order_by(User.created_at.desc()))
     return list(result.scalars().all())
 
 
-async def get_active_users(session: AsyncSession) -> list[User]:
-    """Faol foydalanuvchilarni olish"""
-    now = datetime.now(timezone.utc)
-    result = await session.execute(
+async def get_active_users(db: AsyncSession) -> List[User]:
+    result = await db.execute(
         select(User).where(
-            and_(User.is_active == True, User.expires_at > now)
-        ).order_by(User.created_at.desc())
-    )
-    return list(result.scalars().all())
-
-
-async def get_expired_users(session: AsyncSession) -> list[User]:
-    """Muddati tugagan foydalanuvchilarni olish"""
-    now = datetime.now(timezone.utc)
-    result = await session.execute(
-        select(User).where(
-            User.expires_at <= now
-        ).order_by(User.expires_at.asc())
-    )
-    return list(result.scalars().all())
-
-
-async def get_users_expiring_today(session: AsyncSession) -> list[User]:
-    """Bugun muddati tugaydigan foydalanuvchilar (scheduler uchun)"""
-    now = datetime.now(timezone.utc)
-    end_of_day = now.replace(hour=23, minute=59, second=59)
-    result = await session.execute(
-        select(User).where(
-            and_(
-                User.is_active == True,
-                User.expires_at <= end_of_day,
-                User.expires_at >= now
-            )
+            User.is_active == True,
+            User.expires_at > datetime.utcnow()
         )
     )
     return list(result.scalars().all())
 
 
-# ============================================================
-# SESSION CRUD
-# ============================================================
-
-async def get_active_session_by_user_id(
-    session: AsyncSession,
-    user_id: int
-) -> Optional[Session]:
-    """Foydalanuvchining faol sessiyasini olish"""
-    result = await session.execute(
-        select(Session).where(
-            and_(Session.user_id == user_id, Session.is_connected == True)
+async def get_expired_users(db: AsyncSession) -> List[User]:
+    result = await db.execute(
+        select(User).where(
+            User.expires_at <= datetime.utcnow(),
+            User.is_active == True
         )
-    )
-    return result.scalar_one_or_none()
-
-
-async def create_session(
-    session: AsyncSession,
-    user_id: int,
-    session_string_encrypted: str,
-    phone: str = None
-) -> Session:
-    """Yangi sessiya yaratish"""
-    # Eski sessiyalarni o'chirish (1 ta foydalanuvchi - 1 ta sessiya)
-    await session.execute(
-        delete(Session).where(Session.user_id == user_id)
-    )
-
-    new_session = Session(
-        user_id=user_id,
-        session_string=session_string_encrypted,
-        phone=phone,
-        is_connected=True,
-    )
-    session.add(new_session)
-    await session.flush()
-    await session.refresh(new_session)
-    logger.info(f"Yangi sessiya yaratildi: user_id={user_id}")
-    return new_session
-
-
-async def disconnect_session(session: AsyncSession, user_id: int) -> bool:
-    """Sessiyani o'chirish (foydalanuvchi uzganda)"""
-    result = await session.execute(
-        delete(Session).where(Session.user_id == user_id)
-    )
-    logger.info(f"Sessiya o'chirildi: user_id={user_id}")
-    return result.rowcount > 0
-
-
-async def mark_session_disconnected(
-    session: AsyncSession,
-    session_id: int
-) -> bool:
-    """Sessiyani uzilgan deb belgilash"""
-    result = await session.execute(
-        update(Session)
-        .where(Session.id == session_id)
-        .values(
-            is_connected=False,
-            disconnected_at=datetime.now(timezone.utc)
-        )
-    )
-    return result.rowcount > 0
-
-
-async def get_all_connected_sessions(session: AsyncSession) -> list[Session]:
-    """Barcha ulangan sessiyalarni olish (scheduler uchun)"""
-    result = await session.execute(
-        select(Session).where(Session.is_connected == True)
     )
     return list(result.scalars().all())
 
 
-# ============================================================
-# CHANNEL CRUD
-# ============================================================
-
-async def get_channels_by_user_id(
-    session: AsyncSession,
-    user_id: int,
-    only_active: bool = True
-) -> list[Channel]:
-    """Foydalanuvchi kanallarini olish"""
-    query = select(Channel).where(Channel.user_id == user_id)
-    if only_active:
-        query = query.where(Channel.is_active == True)
-    query = query.order_by(Channel.added_at.asc())
-    result = await session.execute(query)
-    return list(result.scalars().all())
-
-
-async def get_channel_by_id(
-    session: AsyncSession,
-    channel_id: int
-) -> Optional[Channel]:
-    """ID bo'yicha kanal topish"""
-    result = await session.execute(
-        select(Channel).where(Channel.id == channel_id)
+async def update_user_interval(db: AsyncSession, user_id: int, minutes: int):
+    await db.execute(
+        update(User).where(User.id == user_id)
+        .values(interval_minutes=minutes)
     )
-    return result.scalar_one_or_none()
 
 
-async def count_user_channels(session: AsyncSession, user_id: int) -> int:
-    """Foydalanuvchi kanallar sonini hisoblash"""
-    result = await session.execute(
+async def reset_wrong_attempts(db: AsyncSession, user_id: int):
+    await db.execute(
+        update(User).where(User.id == user_id).values(wrong_attempts=0)
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  SESSION CRUD
+# ═══════════════════════════════════════════════════════
+
+async def save_session(db: AsyncSession, user_id: int,
+                        session_string: str, phone: str) -> UserSession:
+    enc = encrypt_text(session_string)
+    existing = await db.execute(
+        select(UserSession).where(UserSession.user_id == user_id)
+    )
+    sess = existing.scalar_one_or_none()
+    if sess:
+        sess.session_string_enc = enc
+        sess.phone = phone
+        sess.is_connected = True
+        sess.connected_at = datetime.utcnow()
+        sess.disconnected_at = None
+    else:
+        sess = UserSession(
+            user_id=user_id,
+            session_string_enc=enc,
+            phone=phone,
+        )
+        db.add(sess)
+    await db.flush()
+    return sess
+
+
+async def get_session(db: AsyncSession, user_id: int) -> Optional[str]:
+    """Decrypted session string qaytaradi"""
+    result = await db.execute(
+        select(UserSession).where(
+            UserSession.user_id == user_id,
+            UserSession.is_connected == True
+        )
+    )
+    sess = result.scalar_one_or_none()
+    if sess:
+        return decrypt_text(sess.session_string_enc)
+    return None
+
+
+async def disconnect_session(db: AsyncSession, user_id: int):
+    await db.execute(
+        update(UserSession).where(UserSession.user_id == user_id)
+        .values(is_connected=False, disconnected_at=datetime.utcnow())
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  CHANNEL CRUD
+# ═══════════════════════════════════════════════════════
+
+async def add_channel(db: AsyncSession, user_id: int,
+                       link: str) -> Optional[Channel]:
+    count_result = await db.execute(
         select(func.count(Channel.id)).where(
-            and_(Channel.user_id == user_id, Channel.is_active == True)
+            Channel.user_id == user_id,
+            Channel.is_active == True
         )
     )
-    return result.scalar_one() or 0
-
-
-async def add_channel(
-    session: AsyncSession,
-    user_id: int,
-    link: str
-) -> Optional[Channel]:
-    """Yangi kanal qo'shish (max 150 ta limit)"""
-    count = await count_user_channels(session, user_id)
-    if count >= 150:
+    count = count_result.scalar()
+    if count >= config.MAX_CHANNELS:
         return None
-
-    channel = Channel(user_id=user_id, link=link, is_active=True)
-    session.add(channel)
-    await session.flush()
-    await session.refresh(channel)
-    logger.info(f"Yangi kanal qo'shildi: user_id={user_id}, link={link}")
-    return channel
+    ch = Channel(user_id=user_id, link=link)
+    db.add(ch)
+    await db.flush()
+    return ch
 
 
-async def delete_channel(session: AsyncSession, channel_id: int) -> bool:
-    """Kanalni o'chirish"""
-    result = await session.execute(
+async def get_user_channels(db: AsyncSession, user_id: int) -> List[Channel]:
+    result = await db.execute(
+        select(Channel).where(
+            Channel.user_id == user_id,
+            Channel.is_active == True
+        ).order_by(Channel.added_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def delete_channel(db: AsyncSession, channel_id: int, user_id: int):
+    await db.execute(
+        delete(Channel).where(
+            Channel.id == channel_id,
+            Channel.user_id == user_id
+        )
+    )
+
+
+async def deactivate_channel(db: AsyncSession, channel_id: int):
+    """Yuborib bo'lmaydigan linkni o'chirib tashlaydi"""
+    await db.execute(
         delete(Channel).where(Channel.id == channel_id)
     )
-    return result.rowcount > 0
 
 
-async def deactivate_channel(session: AsyncSession, channel_id: int) -> bool:
-    """Kanalni deaktiv qilish (xato bo'lganda)"""
-    result = await session.execute(
-        update(Channel)
-        .where(Channel.id == channel_id)
-        .values(is_active=False)
-    )
-    return result.rowcount > 0
+# ═══════════════════════════════════════════════════════
+#  ANNOUNCEMENT CRUD
+# ═══════════════════════════════════════════════════════
 
-
-# ============================================================
-# ANNOUNCEMENT CRUD
-# ============================================================
-
-async def create_announcement(
-    session: AsyncSession,
-    user_id: int,
-    message_text: str,
-    interval_minutes: int = 5
-) -> Announcement:
-    """Yangi e'lon yaratish"""
-    announcement = Announcement(
+async def create_announcement(db: AsyncSession, user_id: int,
+                               text: str, interval: int) -> Announcement:
+    ann = Announcement(
         user_id=user_id,
-        message_text=message_text,
-        status="open",
-        interval_minutes=interval_minutes,
+        message_text=text,
+        interval_minutes=interval,
     )
-    session.add(announcement)
-    await session.flush()
-    await session.refresh(announcement)
-    logger.info(f"Yangi e'lon yaratildi: user_id={user_id}, id={announcement.id}")
-    return announcement
+    db.add(ann)
+    await db.flush()
+    return ann
 
 
-async def get_announcement_by_id(
-    session: AsyncSession,
-    announcement_id: int
-) -> Optional[Announcement]:
-    """ID bo'yicha e'lon topish"""
-    result = await session.execute(
-        select(Announcement).where(Announcement.id == announcement_id)
+async def save_announcement_message_id(db: AsyncSession, ann_id: int,
+                                        msg_id: int):
+    await db.execute(
+        update(Announcement).where(Announcement.id == ann_id)
+        .values(bot_message_id=msg_id)
     )
-    return result.scalar_one_or_none()
 
 
-async def get_open_announcements_by_user(
-    session: AsyncSession,
-    user_id: int
-) -> list[Announcement]:
-    """Foydalanuvchining ochiq e'lonlarini olish"""
-    result = await session.execute(
+async def get_open_announcements(db: AsyncSession) -> List[Announcement]:
+    result = await db.execute(
+        select(Announcement)
+        .where(Announcement.status == AnnouncementStatus.open)
+        .options(selectinload(Announcement.user).selectinload(User.session))
+    )
+    return list(result.scalars().all())
+
+
+async def get_user_open_announcements(db: AsyncSession,
+                                       user_id: int) -> List[Announcement]:
+    result = await db.execute(
         select(Announcement).where(
-            and_(
-                Announcement.user_id == user_id,
-                Announcement.status == "open"
-            )
+            Announcement.user_id == user_id,
+            Announcement.status == AnnouncementStatus.open
         ).order_by(Announcement.created_at.desc())
     )
     return list(result.scalars().all())
 
 
-async def get_closed_announcements_by_user(
-    session: AsyncSession,
-    user_id: int
-) -> list[Announcement]:
-    """Foydalanuvchining yopilgan e'lonlarini olish"""
-    result = await session.execute(
+async def get_user_closed_announcements(db: AsyncSession,
+                                         user_id: int) -> List[Announcement]:
+    result = await db.execute(
         select(Announcement).where(
-            and_(
-                Announcement.user_id == user_id,
-                Announcement.status == "closed"
-            )
+            Announcement.user_id == user_id,
+            Announcement.status == AnnouncementStatus.closed
         ).order_by(Announcement.closed_at.desc())
     )
     return list(result.scalars().all())
 
 
-async def close_announcement(
-    session: AsyncSession,
-    announcement_id: int
-) -> bool:
-    """E'lonni yopish"""
-    result = await session.execute(
-        update(Announcement)
-        .where(Announcement.id == announcement_id)
-        .values(status="closed", closed_at=datetime.now(timezone.utc))
-    )
-    logger.info(f"E'lon yopildi: {announcement_id}")
-    return result.rowcount > 0
-
-
-async def update_announcement_last_sent(
-    session: AsyncSession,
-    announcement_id: int
-) -> None:
-    """E'lon oxirgi yuborilish vaqtini yangilash"""
-    await session.execute(
-        update(Announcement)
-        .where(Announcement.id == announcement_id)
-        .values(last_sent_at=datetime.now(timezone.utc))
-    )
-
-
-async def update_announcement_interval(
-    session: AsyncSession,
-    user_id: int,
-    interval_minutes: int
-) -> bool:
-    """Foydalanuvchining barcha ochiq e'lonlari intervalini yangilash"""
-    result = await session.execute(
-        update(Announcement)
-        .where(
-            and_(
-                Announcement.user_id == user_id,
-                Announcement.status == "open"
-            )
+async def close_announcement(db: AsyncSession, ann_id: int):
+    await db.execute(
+        update(Announcement).where(Announcement.id == ann_id)
+        .values(
+            status=AnnouncementStatus.closed,
+            closed_at=datetime.utcnow()
         )
-        .values(interval_minutes=interval_minutes)
     )
-    return result.rowcount > 0
 
 
-async def get_all_open_announcements(session: AsyncSession) -> list[Announcement]:
-    """Barcha ochiq e'lonlarni olish (scheduler uchun)"""
-    result = await session.execute(
-        select(Announcement).where(Announcement.status == "open")
-    )
-    return list(result.scalars().all())
-
-
-async def close_user_announcements(
-    session: AsyncSession,
-    user_id: int
-) -> int:
-    """Foydalanuvchining barcha ochiq e'lonlarini yopish"""
-    result = await session.execute(
-        update(Announcement)
-        .where(
-            and_(
-                Announcement.user_id == user_id,
-                Announcement.status == "open"
-            )
+async def close_all_user_announcements(db: AsyncSession, user_id: int):
+    await db.execute(
+        update(Announcement).where(
+            Announcement.user_id == user_id,
+            Announcement.status == AnnouncementStatus.open
+        ).values(
+            status=AnnouncementStatus.closed,
+            closed_at=datetime.utcnow()
         )
-        .values(status="closed", closed_at=datetime.now(timezone.utc))
     )
-    return result.rowcount
 
 
-async def delete_old_closed_announcements(session: AsyncSession) -> int:
-    """Bugungi kunda yopilgan e'lonlarni o'chirish (00:00 da ishga tushadi)"""
-    now = datetime.now(timezone.utc)
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    result = await session.execute(
+async def update_last_sent(db: AsyncSession, ann_id: int):
+    await db.execute(
+        update(Announcement).where(Announcement.id == ann_id)
+        .values(last_sent_at=datetime.utcnow())
+    )
+
+
+async def get_announcement_by_id(db: AsyncSession,
+                                   ann_id: int) -> Optional[Announcement]:
+    result = await db.execute(
+        select(Announcement).where(Announcement.id == ann_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def delete_old_closed_announcements(db: AsyncSession):
+    """Har kecha 00:00 da yopilgan e'lonlarni o'chiradi"""
+    from datetime import date
+    today_midnight = datetime.combine(date.today(), datetime.min.time())
+    await db.execute(
         delete(Announcement).where(
-            and_(
-                Announcement.status == "closed",
-                Announcement.closed_at < midnight
-            )
+            Announcement.status == AnnouncementStatus.closed,
+            Announcement.closed_at < today_midnight
         )
     )
-    count = result.rowcount
-    if count:
-        logger.info(f"{count} ta yopilgan e'lon o'chirildi")
-    return count
 
 
-# ============================================================
-# SEND LOG CRUD
-# ============================================================
-
-async def create_send_log(
-    session: AsyncSession,
-    announcement_id: int,
-    channel_id: int,
-    is_success: bool,
-    fail_reason: str = None
-) -> SendLog:
-    """Yuborish logi yaratish"""
+async def add_send_log(db: AsyncSession, ann_id: int, ch_id: int,
+                        success: bool, reason: str = None):
     log = SendLog(
-        announcement_id=announcement_id,
-        channel_id=channel_id,
-        is_success=is_success,
-        fail_reason=fail_reason,
+        announcement_id=ann_id,
+        channel_id=ch_id,
+        is_success=success,
+        fail_reason=reason,
     )
-    session.add(log)
-    await session.flush()
-    return log
+    db.add(log)
+    await db.flush()
 
 
-# ============================================================
-# STATISTIKA
-# ============================================================
+# ═══════════════════════════════════════════════════════
+#  STATISTIKA
+# ═══════════════════════════════════════════════════════
 
-async def get_bot_statistics(session: AsyncSession) -> dict:
-    """Bot statistikasini olish"""
-    now = datetime.now(timezone.utc)
+async def get_statistics(db: AsyncSession) -> dict:
+    now = datetime.utcnow()
 
-    total_users = (await session.execute(
-        select(func.count(User.id))
-    )).scalar_one() or 0
-
-    active_users = (await session.execute(
+    total_users = (await db.execute(select(func.count(User.id)))).scalar()
+    active_users = (await db.execute(
         select(func.count(User.id)).where(
-            and_(User.is_active == True, User.expires_at > now)
+            User.is_active == True, User.expires_at > now
         )
-    )).scalar_one() or 0
-
-    expired_users = (await session.execute(
-        select(func.count(User.id)).where(User.expires_at <= now)
-    )).scalar_one() or 0
-
-    inactive_users = (await session.execute(
+    )).scalar()
+    expired_users = (await db.execute(
+        select(func.count(User.id)).where(
+            User.expires_at <= now, User.is_active == True
+        )
+    )).scalar()
+    inactive_users = (await db.execute(
         select(func.count(User.id)).where(User.is_active == False)
-    )).scalar_one() or 0
-
-    connected_sessions = (await session.execute(
-        select(func.count(Session.id)).where(Session.is_connected == True)
-    )).scalar_one() or 0
-
-    total_announcements = (await session.execute(
+    )).scalar()
+    connected_sessions = (await db.execute(
+        select(func.count(UserSession.id)).where(
+            UserSession.is_connected == True
+        )
+    )).scalar()
+    total_announcements = (await db.execute(
         select(func.count(Announcement.id))
-    )).scalar_one() or 0
-
-    open_announcements = (await session.execute(
-        select(func.count(Announcement.id)).where(Announcement.status == "open")
-    )).scalar_one() or 0
-
-    closed_announcements = (await session.execute(
-        select(func.count(Announcement.id)).where(Announcement.status == "closed")
-    )).scalar_one() or 0
+    )).scalar()
+    open_announcements = (await db.execute(
+        select(func.count(Announcement.id)).where(
+            Announcement.status == AnnouncementStatus.open
+        )
+    )).scalar()
+    closed_announcements = (await db.execute(
+        select(func.count(Announcement.id)).where(
+            Announcement.status == AnnouncementStatus.closed
+        )
+    )).scalar()
 
     return {
-        "total_users": total_users,
-        "active_users": active_users,
-        "inactive_users": inactive_users,
-        "expired_users": expired_users,
-        "connected_sessions": connected_sessions,
-        "total_announcements": total_announcements,
-        "open_announcements": open_announcements,
-        "closed_announcements": closed_announcements,
+        "total_users": total_users or 0,
+        "active_users": active_users or 0,
+        "expired_users": expired_users or 0,
+        "inactive_users": inactive_users or 0,
+        "connected_sessions": connected_sessions or 0,
+        "total_announcements": total_announcements or 0,
+        "open_announcements": open_announcements or 0,
+        "closed_announcements": closed_announcements or 0,
     }

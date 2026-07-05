@@ -1,73 +1,54 @@
 import os
-from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Bot
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
-@dataclass
-class Config:
-    # Bot sozlamalari
-    BOT_TOKEN: str
-    BOT_USERNAME: str
+# Telegram API
+API_ID: int = int(os.getenv("API_ID", "0"))
+API_HASH: str = os.getenv("API_HASH", "")
 
-    # Pyrogram
-    API_ID: int
-    API_HASH: str
+# Database
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
-    # Database
-    DATABASE_URL: str
+# Admin
+ADMIN_TELEGRAM_ID: int = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_GMAIL: str = os.getenv("ADMIN_GMAIL", "")
+ADMIN_PHONE: str = os.getenv("ADMIN_PHONE", "")
+ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "")
 
-    # Xavfsizlik
-    ENCRYPTION_KEY: str
+# Gmail SMTP
+GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "")
 
-    # Gmail
-    GMAIL_USER: str
-    GMAIL_APP_PASSWORD: str
+# Encryption
+ENCRYPTION_KEY: str = os.getenv("ENCRYPTION_KEY", "")
 
-    # Admin
-    ADMIN_TELEGRAM_ID: int
-    ADMIN_USERNAME: str
-    ADMIN_PHONE: str
+# Cheklovlar
+MAX_WRONG_ATTEMPTS: int = 10
+MAX_CHANNELS: int = 150
+DEFAULT_INTERVAL: int = 5
+OTP_EXPIRE_SECONDS: int = 300
+OTP_MAX_ATTEMPTS: int = 3
+SESSION_SEND_DELAY: float = 0.8
 
+# Timezone
+TIMEZONE: str = "Asia/Tashkent"
 
-def load_config() -> Config:
-    """Konfiguratsiyani .env fayldan yuklaydi"""
-
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
-        raise ValueError("BOT_TOKEN .env faylda topilmadi!")
-
-    api_id = os.getenv("API_ID")
-    if not api_id:
-        raise ValueError("API_ID .env faylda topilmadi!")
-
-    api_hash = os.getenv("API_HASH")
-    if not api_hash:
-        raise ValueError("API_HASH .env faylda topilmadi!")
-
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise ValueError("DATABASE_URL .env faylda topilmadi!")
-
-    encryption_key = os.getenv("ENCRYPTION_KEY")
-    if not encryption_key:
-        raise ValueError("ENCRYPTION_KEY .env faylda topilmadi!")
-
-    return Config(
-        BOT_TOKEN=bot_token,
-        BOT_USERNAME=os.getenv("BOT_USERNAME", ""),
-        API_ID=int(api_id),
-        API_HASH=api_hash,
-        DATABASE_URL=database_url,
-        ENCRYPTION_KEY=encryption_key,
-        GMAIL_USER=os.getenv("GMAIL_USER", ""),
-        GMAIL_APP_PASSWORD=os.getenv("GMAIL_APP_PASSWORD", ""),
-        ADMIN_TELEGRAM_ID=int(os.getenv("ADMIN_TELEGRAM_ID", "0")),
-        ADMIN_USERNAME=os.getenv("ADMIN_USERNAME", ""),
-        ADMIN_PHONE=os.getenv("ADMIN_PHONE", ""),
-    )
-
-
-# Global config obyekti
-config = load_config()
+def validate_config():
+    required = {
+        "BOT_TOKEN": BOT_TOKEN,
+        "API_ID": API_ID,
+        "API_HASH": API_HASH,
+        "DATABASE_URL": DATABASE_URL,
+        "ADMIN_TELEGRAM_ID": ADMIN_TELEGRAM_ID,
+        "ADMIN_PASSWORD": ADMIN_PASSWORD,
+        "ENCRYPTION_KEY": ENCRYPTION_KEY,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise ValueError(f"❌ .env faylda yetishmayapti: {', '.join(missing)}")
+    if len(ENCRYPTION_KEY) < 32:
+        raise ValueError("❌ ENCRYPTION_KEY kamida 32 belgi bo'lishi kerak!")

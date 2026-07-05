@@ -1,31 +1,12 @@
-# Telegram Bot Framework
 aiogram==3.7.0
-
-# Telegram User Account
 pyrogram==2.0.106
-tgcrypto==1.2.5
-
-# Ma'lumotlar bazasi
-sqlalchemy==2.0.30
+TgCrypto==1.2.5
+SQLAlchemy==2.0.30
 asyncpg==0.29.0
 alembic==1.13.1
-
-# Parol xavfsizligi
+python-dotenv==1.0.1
 bcrypt==4.1.3
 cryptography==42.0.5
-
-# Environment variables
-python-dotenv==1.0.1
-
-# Email yuborish
-aiosmtplib==3.0.1
-
-# Scheduling
 apscheduler==3.10.4
-
-# Logging
-loguru==0.7.2
-
-# Utilities
-python-dateutil==2.9.0
+aiosmtplib==3.0.1
 pytz==2024.1
