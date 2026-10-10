@@ -128,11 +128,14 @@ def share_contact_keyboard() -> ReplyKeyboardMarkup:
 def admin_main_menu() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Foydalanuvchi qo'shish")
+    kb.button(text="🆕 Yangi foydalanuvchilar")
     kb.button(text="👥 Foydalanuvchilar ro'yhati")
     kb.button(text="📊 Bot statistikasi")
+    kb.button(text="📢 Hammaga xabar yuborish")
+    kb.button(text="🔗 Guruhlar linki")
     kb.button(text="⚙️ Admin sozlamalari")
     kb.button(text="🚪 Chiqish")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2, 1, 1)
     return kb.as_markup(resize_keyboard=True)
 
 
@@ -150,8 +153,18 @@ def users_list_menu() -> ReplyKeyboardMarkup:
 
 
 # ═══════════════════════════════════════════════════════
-#  OY TANLASH
+#  MUDDAT TANLASH (bepul sinov + oylar)
 # ═══════════════════════════════════════════════════════
+def duration_keyboard(prefix: str = "dur") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎁 3 kun (bepul sinov)", callback_data=f"{prefix}:3d")
+    for m in range(1, 13):
+        builder.button(text=f"{m} oy", callback_data=f"{prefix}:{m}m")
+    builder.adjust(1, 4, 4, 4)
+    return builder.as_markup()
+
+
+# Eski (faqat oylik) klaviatura — moslik uchun qoldirilgan
 def months_keyboard(prefix: str = "months") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for m in range(1, 13):
@@ -161,15 +174,51 @@ def months_keyboard(prefix: str = "months") -> InlineKeyboardMarkup:
 
 
 # ═══════════════════════════════════════════════════════
+#  ADMIN — YANGI FOYDALANUVCHILAR (bo'tga /start bosganlar)
+# ═══════════════════════════════════════════════════════
+def pending_user_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Foydalanuvchiga ishlatishga ruhsat berish",
+        callback_data=f"pending:grant:{telegram_id}"
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# ═══════════════════════════════════════════════════════
+#  ADMIN — UMUMIY GURUH LINKLARI MENYUSI
+# ═══════════════════════════════════════════════════════
+def shared_channels_menu() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="➕ Link qo'shish (umumiy)")
+    kb.button(text="📋 Umumiy linklarni ko'rish")
+    kb.button(text="🔙 Admin menyu")
+    kb.adjust(2, 1)
+    return kb.as_markup(resize_keyboard=True)
+
+
+# ═══════════════════════════════════════════════════════
 #  FOYDALANUVCHI KARTASI (Admin uchun)
 # ═══════════════════════════════════════════════════════
 def user_action_keyboard(user_id: int,
-                          show_extend: bool = False) -> InlineKeyboardMarkup:
+                          show_extend: bool = False,
+                          use_shared_channels: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if show_extend:
         builder.button(
             text="📅 Muddatni uzaytirish",
             callback_data=f"admin_user:extend:{user_id}"
+        )
+    if use_shared_channels:
+        builder.button(
+            text="🚫 Umumiy linklarni bekor qilish",
+            callback_data=f"admin_user:shared_off:{user_id}"
+        )
+    else:
+        builder.button(
+            text="🔗 Umumiy linklarga ruxsat berish",
+            callback_data=f"admin_user:shared_on:{user_id}"
         )
     builder.button(
         text="🗑 O'chirish",

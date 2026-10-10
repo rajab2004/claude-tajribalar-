@@ -12,7 +12,7 @@ from utils.keyboards import (
     channels_menu, user_main_menu,
     save_cancel_keyboard, InlineKeyboardBuilder
 )
-from utils.helpers import is_valid_channel_link
+from utils.helpers import is_valid_channel_link, parse_bulk_links
 import config
 
 router = Router()
@@ -57,35 +57,80 @@ async def add_channel_start(message: Message, state: FSMContext,
 
     await state.set_state(ChannelStates.waiting_link)
     await message.answer(
-        "🔗 Guruh yoki kanal linkini kiriting:\n\n"
-        "📌 Format: https://t.me/guruhadi yoki @guruhadi\n\n"
+        "🔗 Guruh yoki kanal linkini kiriting.\n\n"
+        "📌 1 ta link ham, 150 tagacha link ham yuborishingiz mumkin — "
+        "har birini alohida qatorga yozing:\n"
+        "https://t.me/guruh1\n"
+        "https://t.me/guruh2\n"
+        "@guruh3 ...\n\n"
         "⚠️ <b>Muhim eslatma:</b>\n"
         "Xabarlar <b>sizning Telegram akkauntingizdan</b> yuboriladi.\n"
         "Shuning uchun:\n"
         "  • Siz o'sha guruh/kanalga a'zo bo'lishingiz kerak\n"
         "  • Guruhda yozish imkoniyati cheklanmagan bo'lishi kerak\n"
         "  • Guruhda siz muzlatilmagan bo'lishingiz kerak\n\n"
-        "🤖 Bot guruhda admin bo'lishi shart emas!",
+        "🤖 Bot guruhga o'zi qo'shilmaydi — faqat siz allaqachon "
+        "a'zo bo'lgan guruhga yozadi!",
         parse_mode="HTML"
     )
 
 
 @router.message(ChannelStates.waiting_link)
-async def add_channel_link(message: Message, state: FSMContext):
-    link = message.text.strip()
-    if not is_valid_channel_link(link):
+async def add_channel_link(message: Message, state: FSMContext,
+                            db: AsyncSession):
+    tg_id = message.from_user.id
+    user = await crud.get_user_by_telegram_id(db, tg_id)
+    if not user:
+        await state.clear()
+        return
+
+    links, invalid_count = parse_bulk_links(message.text or "")
+    if not links:
         await message.answer(
-            "❌ Noto'g'ri link formati!\n"
-            "Format: https://t.me/guruhadi yoki @guruhadi"
+            "❌ To'g'ri formatdagi link topilmadi!\n"
+            "Format: https://t.me/guruhadi yoki @guruhadi\n"
+            "Bir nechta bo'lsa — har birini alohida qatorga yozing."
         )
         return
 
-    await state.update_data(link=link)
-    kb = save_cancel_keyboard("ch:save", "ch:cancel")
+    existing = await crud.get_user_channel_links(db, user.id)
+    new_links = [l for l in links if l not in existing]
+    already_added = len(links) - len(new_links)
+
+    room = max(0, config.MAX_CHANNELS - len(existing))
+    to_save = new_links[:room]
+    overflow = len(new_links) - len(to_save)
+
+    if not to_save:
+        await message.answer(
+            "❌ Saqlash uchun bo'sh joy yo'q yoki barcha linklar "
+            "allaqachon qo'shilgan."
+        )
+        return
+
+    await state.update_data(links=to_save)
+
+    if len(links) == 1 and len(to_save) == 1:
+        text = f"🔗 Link: <code>{to_save[0]}</code>\n\nSaqlaysizmi?"
+    else:
+        text = (
+            f"📊 {len(links)} ta link aniqlandi.\n"
+            f"✅ Saqlanadigan: {len(to_save)} ta\n"
+        )
+        if already_added:
+            text += f"♻️ {already_added} ta allaqachon qo'shilgan (o'tkazib yuborildi)\n"
+        if invalid_count:
+            text += f"⚠️ {invalid_count} ta noto'g'ri formatda edi\n"
+        if overflow:
+            text += (
+                f"🚫 {overflow} ta link {config.MAX_CHANNELS} ta limit "
+                f"tufayli sig'madi\n"
+            )
+        text += f"\n<b>{len(to_save)} ta linkni saqlamoqchimisiz?</b>"
+
     await message.answer(
-        f"🔗 Link: <code>{link}</code>\n\n"
-        f"Saqlaysizmi?",
-        reply_markup=kb,
+        text,
+        reply_markup=save_cancel_keyboard("ch:save", "ch:cancel"),
         parse_mode="HTML"
     )
 
@@ -94,21 +139,29 @@ async def add_channel_link(message: Message, state: FSMContext):
 async def save_channel(callback: CallbackQuery, state: FSMContext,
                         db: AsyncSession):
     data = await state.get_data()
+    links = data.get("links", [])
     tg_id = callback.from_user.id
     user = await crud.get_user_by_telegram_id(db, tg_id)
 
-    ch = await crud.add_channel(db, user.id, data["link"])
+    if not user or not links:
+        await callback.message.edit_text("❌ Xatolik yuz berdi.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    result = await crud.add_channels_bulk(db, user.id, links)
     await db.commit()
     await state.clear()
 
-    if ch is None:
-        await callback.message.edit_text(
-            f"❌ Maksimal {config.MAX_CHANNELS} ta limit!"
+    parts = [f"✅ {result['added']} ta link muvaffaqiyatli saqlandi!"]
+    if result["duplicates"]:
+        parts.append(f"♻️ {result['duplicates']} ta takroriy edi")
+    if result["overflow"]:
+        parts.append(
+            f"🚫 {result['overflow']} ta link {config.MAX_CHANNELS} ta "
+            f"limit tufayli saqlanmadi"
         )
-    else:
-        await callback.message.edit_text(
-            f"✅ Link muvaffaqiyatli qo'shildi!\n🔗 {data['link']}"
-        )
+    await callback.message.edit_text("\n".join(parts))
     await callback.answer()
 
 

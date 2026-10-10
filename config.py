@@ -29,10 +29,21 @@ ENCRYPTION_KEY: str = os.getenv("ENCRYPTION_KEY", "")
 # Cheklovlar
 MAX_WRONG_ATTEMPTS: int = 10
 MAX_CHANNELS: int = 150
+MAX_SHARED_CHANNELS: int = 150
 DEFAULT_INTERVAL: int = 5
 OTP_EXPIRE_SECONDS: int = 300
 OTP_MAX_ATTEMPTS: int = 3
-SESSION_SEND_DELAY: float = 0.8
+SESSION_SEND_DELAY_MIN: float = 5.0
+SESSION_SEND_DELAY_MAX: float = 10.0
+
+# Guruhga yozib bo'lmagan holatda (FloodWait) qancha soniyagacha
+# shu yerning o'zida kutib, keyin qayta urinib ko'rish mumkin.
+# Bundan uzoqroq kutish talab qilinsa — guruh o'chirilmaydi, shunchaki
+# navbatdagi rejalashtirilgan yuborishda avtomatik qayta urinadi.
+FLOOD_WAIT_INLINE_MAX: int = 120  # 2 daqiqa
+
+# Bepul sinov muddati (kun)
+TRIAL_DAYS: int = 3
 
 # Timezone
 TIMEZONE: str = "Asia/Tashkent"

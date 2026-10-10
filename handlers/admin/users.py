@@ -1,6 +1,7 @@
 """
 Admin — foydalanuvchilar boshqaruvi
 """
+from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
@@ -11,10 +12,13 @@ from database import crud
 from services.password_gen import generate_password
 from utils.keyboards import (
     admin_main_menu, users_list_menu,
-    months_keyboard, user_action_keyboard,
-    save_cancel_keyboard
+    duration_keyboard, pending_user_keyboard,
+    user_action_keyboard, save_cancel_keyboard
 )
-from utils.helpers import format_expiry, normalize_phone
+from utils.helpers import (
+    format_expiry, normalize_phone,
+    duration_callback_to_days, format_duration_label
+)
 import config
 
 router = Router()
@@ -27,12 +31,8 @@ class AddUserStates(StatesGroup):
     waiting_confirm = State()
 
 
-class ExtendUserStates(StatesGroup):
-    waiting_months = State()
-
-
 # ═══════════════════════════════════════════════════════
-#  FOYDALANUVCHI QO'SHISH
+#  FOYDALANUVCHI QO'SHISH (admin qo'lda ID kiritib)
 # ═══════════════════════════════════════════════════════
 
 @router.message(F.text == "➕ Foydalanuvchi qo'shish")
@@ -77,17 +77,18 @@ async def add_user_phone(message: Message, state: FSMContext):
     await state.set_state(AddUserStates.waiting_months)
     await message.answer(
         f"🔑 Avtomatik parol: <code>{password}</code>\n\n"
-        f"📅 Necha oy ishlata olsin?",
-        reply_markup=months_keyboard("add_months"),
+        f"📅 Qancha muddatga ruxsat berilsin?",
+        reply_markup=duration_keyboard("add_months"),
         parse_mode="HTML"
     )
 
 
 @router.callback_query(F.data.startswith("add_months:"))
 async def add_user_months(callback: CallbackQuery, state: FSMContext):
-    months = int(callback.data.split(":")[1])
+    value = callback.data.split(":", 1)[1]
+    days = duration_callback_to_days(value)
     data = await state.get_data()
-    await state.update_data(months=months)
+    await state.update_data(days=days, duration_label=format_duration_label(value))
 
     await callback.message.edit_text(
         f"📋 Yangi foydalanuvchi:\n"
@@ -95,7 +96,7 @@ async def add_user_months(callback: CallbackQuery, state: FSMContext):
         f"👤 Telegram ID: <code>{data['tg_id']}</code>\n"
         f"📞 Telefon: {data['phone']}\n"
         f"🔑 Parol: <code>{data['password']}</code>\n"
-        f"📅 Muddat: {months} oy\n"
+        f"📅 Muddat: {format_duration_label(value)}\n"
         f"{'━' * 25}\n\n"
         f"Saqlaysizmi?",
         reply_markup=save_cancel_keyboard("admin_user:save", "admin_user:cancel"),
@@ -115,9 +116,12 @@ async def add_user_save(callback: CallbackQuery, state: FSMContext,
         telegram_id=data["tg_id"],
         phone=data["phone"],
         password=data["password"],
-        months=data["months"],
+        days=data["days"],
         admin_id=admin.id if admin else 1,
     )
+    # Agar bu odam avval /start bosgan bo'lsa — "yangi foydalanuvchilar"
+    # ro'yhatidan olib tashlanadi
+    await crud.mark_start_event_granted(db, data["tg_id"])
     await db.commit()
     await state.clear()
 
@@ -129,7 +133,7 @@ async def add_user_save(callback: CallbackQuery, state: FSMContext,
             f"🎉 Xush kelibsiz!\n\n"
             f"Sizga bot kirish ma'lumotlari:\n"
             f"🔑 Parol: <code>{data['password']}</code>\n"
-            f"📅 Muddat: {data['months']} oy\n\n"
+            f"📅 Muddat: {data.get('duration_label', '')}\n\n"
             f"Botga o'tish va boshlash uchun /start bosing.",
             parse_mode="HTML"
         )
@@ -147,6 +151,56 @@ async def add_user_save(callback: CallbackQuery, state: FSMContext,
 async def add_user_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Bekor qilindi.")
+    await callback.answer()
+
+
+# ═══════════════════════════════════════════════════════
+#  YANGI FOYDALANUVCHILAR (bo'tga /start bosgan, hali ruxsat berilmagan)
+# ═══════════════════════════════════════════════════════
+
+@router.message(F.text == "🆕 Yangi foydalanuvchilar")
+async def pending_users_list(message: Message, db: AsyncSession):
+    if message.from_user.id != config.ADMIN_TELEGRAM_ID:
+        return
+    events = await crud.get_pending_start_events(db)
+
+    if not events:
+        await message.answer(
+            "📭 Hozircha yangi /start bosgan foydalanuvchi yo'q.",
+            reply_markup=admin_main_menu()
+        )
+        return
+
+    for ev in events:
+        uname = f"@{ev.username}" if ev.username else "—"
+        await message.answer(
+            f"🆕 ID: <code>{ev.telegram_id}</code>\n"
+            f"👤 Ism: {ev.full_name or '—'}\n"
+            f"🔗 Username: {uname}\n"
+            f"🕐 /start bosgan: {ev.started_at.strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=pending_user_keyboard(ev.telegram_id),
+            parse_mode="HTML"
+        )
+
+    await message.answer(
+        f"📊 Jami: {len(events)} ta yangi foydalanuvchi",
+        reply_markup=admin_main_menu()
+    )
+
+
+@router.callback_query(F.data.startswith("pending:grant:"))
+async def pending_grant_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != config.ADMIN_TELEGRAM_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    tg_id = int(callback.data.split(":")[2])
+    await state.update_data(tg_id=tg_id)
+    await state.set_state(AddUserStates.waiting_phone)
+    await callback.message.edit_text(
+        f"👤 Telegram ID: <code>{tg_id}</code>\n\n"
+        f"📞 Telefon raqamini kiriting (+998XXXXXXXXX):",
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 
@@ -175,7 +229,6 @@ async def all_users(message: Message, db: AsyncSession):
         return
 
     for user in users:
-        from datetime import datetime
         is_exp = user.expires_at < datetime.utcnow()
         status = "🔴 Muddati tugagan" if is_exp else ("🟢 Faol" if user.is_active else "⚫ Nofaol")
         await message.answer(
@@ -183,7 +236,9 @@ async def all_users(message: Message, db: AsyncSession):
             f"📞 Tel: {user.phone or '—'}\n"
             f"📅 {format_expiry(user.expires_at)}\n"
             f"⚡ {status}",
-            reply_markup=user_action_keyboard(user.id),
+            reply_markup=user_action_keyboard(
+                user.id, use_shared_channels=user.use_shared_channels
+            ),
             parse_mode="HTML"
         )
 
@@ -205,7 +260,9 @@ async def active_users(message: Message, db: AsyncSession):
             f"🟢 ID: <code>{user.telegram_id}</code>\n"
             f"📞 Tel: {user.phone or '—'}\n"
             f"📅 {format_expiry(user.expires_at)}",
-            reply_markup=user_action_keyboard(user.id),
+            reply_markup=user_action_keyboard(
+                user.id, use_shared_channels=user.use_shared_channels
+            ),
             parse_mode="HTML"
         )
 
@@ -227,7 +284,10 @@ async def expired_users_list(message: Message, db: AsyncSession):
             f"⏰ ID: <code>{user.telegram_id}</code>\n"
             f"📞 Tel: {user.phone or '—'}\n"
             f"📅 Tugagan: {user.expires_at.strftime('%d.%m.%Y')}",
-            reply_markup=user_action_keyboard(user.id, show_extend=True),
+            reply_markup=user_action_keyboard(
+                user.id, show_extend=True,
+                use_shared_channels=user.use_shared_channels
+            ),
             parse_mode="HTML"
         )
 
@@ -267,7 +327,7 @@ async def extend_user_cb(callback: CallbackQuery, state: FSMContext):
     await state.update_data(extend_user_id=user_id)
     await callback.message.edit_text(
         "📅 Qancha muddatga uzaytirmoqchisiz?",
-        reply_markup=months_keyboard("extend_months")
+        reply_markup=duration_keyboard("extend_months")
     )
     await callback.answer()
 
@@ -275,7 +335,8 @@ async def extend_user_cb(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("extend_months:"))
 async def extend_months_cb(callback: CallbackQuery, state: FSMContext,
                             db: AsyncSession):
-    months = int(callback.data.split(":")[1])
+    value = callback.data.split(":", 1)[1]
+    days = duration_callback_to_days(value)
     data = await state.get_data()
     user_id = data.get("extend_user_id")
 
@@ -283,7 +344,7 @@ async def extend_months_cb(callback: CallbackQuery, state: FSMContext,
         await callback.answer("❌ Xatolik!", show_alert=True)
         return
 
-    await crud.extend_user_expiry(db, user_id, months)
+    await crud.extend_user_expiry(db, user_id, days)
     user = await crud.get_user_by_id(db, user_id)
     await db.commit()
     await state.clear()
@@ -293,15 +354,66 @@ async def extend_months_cb(callback: CallbackQuery, state: FSMContext,
             await callback.bot.send_message(
                 user.telegram_id,
                 f"🎉 Hisobingiz faollashtirildi!\n"
-                f"📅 Yangi muddat: {user.expires_at.strftime('%d.%m.%Y')} gacha"
+                f"📅 Yangi muddat: {user.expires_at.strftime('%d.%m.%Y')} gacha\n\n"
+                f"✅ Hammasi avvalgidek ishlashda davom etadi — "
+                f"e'lonlaringiz va guruhlaringiz saqlanib qolgan."
             )
         except Exception:
             pass
 
     await callback.message.edit_text(
-        f"✅ Muddat {months} oyga uzaytirildi!"
+        f"✅ Muddat {format_duration_label(value)}ga uzaytirildi!"
     )
     await callback.answer()
+
+
+# ─── Umumiy (shared) guruh linklaridan foydalanish ruxsati ─────────────
+@router.callback_query(F.data.startswith("admin_user:shared_on:"))
+async def shared_on_cb(callback: CallbackQuery, db: AsyncSession):
+    if callback.from_user.id != config.ADMIN_TELEGRAM_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[2])
+    await crud.set_user_shared_permission(db, user_id, True)
+    user = await crud.get_user_by_id(db, user_id)
+    await db.commit()
+
+    if user:
+        try:
+            await callback.bot.send_message(
+                user.telegram_id,
+                "🔗 Admin sizga umumiy guruh linklaridan foydalanishga "
+                "ruxsat berdi! Endi o'zingiz guruh qo'shmasangiz ham "
+                "e'lon yuborishingiz mumkin."
+            )
+        except Exception:
+            pass
+
+    await callback.answer("✅ Ruxsat berildi")
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=user_action_keyboard(user_id, use_shared_channels=True)
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("admin_user:shared_off:"))
+async def shared_off_cb(callback: CallbackQuery, db: AsyncSession):
+    if callback.from_user.id != config.ADMIN_TELEGRAM_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[2])
+    await crud.set_user_shared_permission(db, user_id, False)
+    await db.commit()
+
+    await callback.answer("✅ Ruxsat bekor qilindi")
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=user_action_keyboard(user_id, use_shared_channels=False)
+        )
+    except Exception:
+        pass
 
 
 @router.message(F.text == "🔙 Admin menyu")

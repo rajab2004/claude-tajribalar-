@@ -44,6 +44,9 @@ class User(Base):
     expires_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     created_by = Column(Integer, ForeignKey("admins.id"), nullable=True)
+    # Admin ruxsat bersa, foydalanuvchi o'zi guruh qo'shmasdan
+    # umumiy (admin qo'shgan) guruh linklaridan foydalana oladi
+    use_shared_channels = Column(Boolean, default=False)
 
     session = relationship("UserSession", back_populates="user",
                            uselist=False, cascade="all, delete-orphan")
@@ -119,3 +122,24 @@ class SendLog(Base):
     fail_reason = Column(String(255), nullable=True)
 
     announcement = relationship("Announcement", back_populates="send_logs")
+
+
+# ─── StartEvent (bot(ga) /start bosgan, hali ro'yxatdan o'tmagan odamlar) ──
+class StartEvent(Base):
+    __tablename__ = "start_events"
+
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String(100), nullable=True)
+    full_name = Column(String(255), nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    granted = Column(Boolean, default=False)  # admin ruxsat berganmi
+
+
+# ─── SharedChannel (admin qo'shgan umumiy guruh linklari) ─────────────
+class SharedChannel(Base):
+    __tablename__ = "shared_channels"
+
+    id = Column(Integer, primary_key=True)
+    link = Column(String(255), nullable=False, unique=True)
+    added_at = Column(DateTime, default=datetime.utcnow)

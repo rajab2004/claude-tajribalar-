@@ -24,37 +24,42 @@ from handlers.user.settings import router as settings_router
 from handlers.admin.auth import router as admin_auth_router
 from handlers.admin.users import router as admin_users_router
 from handlers.admin.stats import router as admin_stats_router
+from handlers.admin.broadcast import router as admin_broadcast_router
+from handlers.admin.shared_channels import router as admin_shared_channels_router
 
 from middlewares.auth_middleware import AuthMiddleware
 from services.scheduler import setup_scheduler
 from services.pyrogram_client import get_client, load_all_sessions
 
+# Barcha kutubxona loglarini o'chirish (aiogram, pyrogram, sqlalchemy...)
+for _noisy in ["aiogram", "pyrogram", "sqlalchemy", "apscheduler",
+               "asyncio", "aiohttp", "urllib3"]:
+    logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+
+# Xatolarni faylga yozish (terminalda ko'rinmaydi)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ]
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8")],
 )
-logger = logging.getLogger(__name__)
+
+# Terminal uchun faqat bot logger
+logger = logging.getLogger("bot")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(_console)
 
 
 async def on_startup(bot: Bot):
-    logger.info("🚀 Bot ishga tushmoqda...")
-
     validate_config()
-
     await init_db()
-    logger.info("✅ Database tayyor")
 
     async with AsyncSessionLocal() as db:
-        # Admin yaratish
         await crud.create_admin(db)
         await db.commit()
 
-        # Bot qayta ishga tushganda barcha foydalanuvchi sessionlarini yuklash
-        logger.info("📱 Foydalanuvchi akkauntlari yuklanmoqda...")
         users = await crud.get_active_users(db)
         sessions_to_load = []
         for user in users:
@@ -64,19 +69,14 @@ async def on_startup(bot: Bot):
 
     if sessions_to_load:
         await load_all_sessions(sessions_to_load)
-        logger.info(f"✅ {len(sessions_to_load)} ta akkaunt sessioni yuklandi")
-    else:
-        logger.info("ℹ️ Aktiv session topilmadi")
 
     setup_scheduler(bot)
-    logger.info("✅ Scheduler tayyor")
 
     me = await bot.get_me()
     logger.info(f"✅ Bot ishga tushdi: @{me.username}")
 
 
 async def on_shutdown(bot: Bot):
-    logger.info("⛔ Bot to'xtatilmoqda...")
     from services.scheduler import scheduler
     if scheduler.running:
         scheduler.shutdown(wait=False)
@@ -102,6 +102,8 @@ async def main():
     dp.include_router(admin_auth_router)
     dp.include_router(admin_users_router)
     dp.include_router(admin_stats_router)
+    dp.include_router(admin_broadcast_router)
+    dp.include_router(admin_shared_channels_router)
     dp.include_router(user_auth_router)
     dp.include_router(connect_router)
     dp.include_router(channels_router)
@@ -111,7 +113,6 @@ async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    logger.info("🤖 Polling boshlandi...")
     try:
         await dp.start_polling(
             bot,

@@ -19,7 +19,7 @@ from utils.keyboards import (
     close_announcement_keyboard,
     save_cancel_keyboard
 )
-from utils.helpers import truncate
+from utils.helpers import truncate, random_send_delay, vary_message_text
 import config
 
 router = Router()
@@ -50,13 +50,15 @@ async def new_announcement_start(message: Message, state: FSMContext,
         )
         return
 
-    channels = await crud.get_user_channels(db, user.id)
-    if not channels:
+    own_channels, shared_channels = await crud.get_effective_channels(db, user)
+    if not own_channels and not shared_channels:
         await message.answer(
             "❌ Hech qanday guruh/kanal qo'shilmagan!\n"
-            "📢 Avval '📢 Guruh va kanallar' bo'limidan qo'shing."
+            "📢 Avval '📢 Guruh va kanallar' bo'limidan qo'shing yoki "
+            "admindan umumiy linklardan foydalanishga ruxsat so'rang."
         )
         return
+    channels = own_channels + shared_channels
 
     await state.set_state(AnnouncementStates.waiting_text)
     await message.answer(
@@ -171,37 +173,54 @@ async def _send_from_user_account(bot: Bot, user_data: dict,
                 )
                 return
 
-            # Guruh/kanallar ro'yhati
-            channels = await crud.get_user_channels(db, user_id)
-            if not channels:
+            # Guruh/kanallar ro'yhati (o'zi qo'shgan + ruxsat bo'lsa umumiy)
+            user_obj = await crud.get_user_by_id(db, user_id)
+            own_channels, shared_channels = await crud.get_effective_channels(
+                db, user_obj
+            )
+            if not own_channels and not shared_channels:
                 return
 
             sent_count = 0
-            failed_count = 0
+            removed_count = 0
+            pending_count = 0
             failed_ch_ids = []
 
-            # Har bir guruh/kanalga foydalanuvchi akkauntidan yuborish
-            for ch in channels:
-                success, reason = await send_to_channel(client, ch.link, text)
-
+            # Foydalanuvchi o'zi qo'shgan guruhlar — doimiy xatoda o'chiriladi
+            for ch in own_channels:
+                success, reason, permanent = await send_to_channel(
+                    client, ch.link, vary_message_text(text)
+                )
                 if success:
                     sent_count += 1
                     await crud.add_send_log(db, ann_id, ch.id, True)
-                    logger.info(
-                        f"✅ User {user_id} akkauntidan {ch.link} ga yuborildi"
-                    )
-                else:
-                    failed_count += 1
+                elif permanent:
+                    removed_count += 1
                     failed_ch_ids.append(ch.id)
                     await crud.add_send_log(db, ann_id, ch.id, False, reason)
-                    logger.warning(
-                        f"❌ User {user_id} — {ch.link}: {reason}"
-                    )
+                    logger.warning(f"❌ User {user_id} — {ch.link}: {reason}")
+                else:
+                    # vaqtincha yuborilmadi — guruh o'chirilmaydi,
+                    # keyingi rejalashtirilgan yuborishda qayta urinadi
+                    pending_count += 1
+                    await crud.add_send_log(db, ann_id, ch.id, False, reason)
+                    logger.info(f"⏳ User {user_id} — {ch.link}: {reason}")
+                await asyncio.sleep(random_send_delay())
 
-                # Flood limit oldini olish
-                await asyncio.sleep(config.SESSION_SEND_DELAY)
+            # Umumiy (shared) guruhlar — hech qachon o'chirilmaydi,
+            # chunki ular boshqa foydalanuvchilar uchun ham amal qiladi
+            for ch in shared_channels:
+                success, reason, _permanent = await send_to_channel(
+                    client, ch.link, vary_message_text(text)
+                )
+                if success:
+                    sent_count += 1
+                else:
+                    pending_count += 1
+                    logger.info(f"⏳ (umumiy) {ch.link}: {reason}")
+                await asyncio.sleep(random_send_delay())
 
-            # Kirish imkoni yo'q kanallarni o'chirish
+            # Faqat haqiqatan yaroqsiz (a'zo emas/bloklangan) guruhlarni o'chirish
             for ch_id in failed_ch_ids:
                 await crud.deactivate_channel(db, ch_id)
 
@@ -209,11 +228,16 @@ async def _send_from_user_account(bot: Bot, user_data: dict,
             await db.commit()
 
             # Natija xabari
-            msg_parts = [f"📊 <b>Yuborish natijasi:</b>"]
+            msg_parts = ["📊 <b>Yuborish natijasi:</b>"]
             msg_parts.append(f"✅ {sent_count} ta guruhga yetkazildi")
-            if failed_count > 0:
+            if pending_count > 0:
                 msg_parts.append(
-                    f"❌ {failed_count} ta guruh o'chirildi "
+                    f"⏳ {pending_count} ta guruh hozircha band — "
+                    f"navbatdagi yuborishda avtomatik qayta urinadi"
+                )
+            if removed_count > 0:
+                msg_parts.append(
+                    f"❌ {removed_count} ta guruh ro'yhatdan o'chirildi "
                     f"(akkauntingiz a'zo emas yoki yozish huquqi yo'q)"
                 )
             await bot.send_message(tg_id, "\n".join(msg_parts),

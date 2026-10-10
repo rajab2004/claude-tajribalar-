@@ -106,46 +106,67 @@ async def disconnect_client(user_id: int):
         logger.info(f"User {user_id} client uzildi")
 
 
-async def send_to_channel(client: Client, link: str, text: str) -> tuple[bool, str]:
+async def send_to_channel(client: Client, link: str,
+                           text: str) -> tuple[bool, str, bool]:
     """
     Foydalanuvchi akkauntidan guruh/kanalga xabar yuboradi.
     (Bot nomidan EMAS — foydalanuvchi o'z akkauntidan yuboradi)
+    Bot hech qachon guruhga o'zi qo'shilmaydi — faqat foydalanuvchi
+    allaqachon a'zo bo'lgan guruhlarga yozadi.
 
-    Returns: (muvaffaqiyatli, xato_sababi)
+    Returns: (muvaffaqiyatli, xato_sababi, doimiy_xatomi)
+        doimiy_xato=True bo'lsa — guruh haqiqatan ham yaroqsiz
+                     (masalan a'zo emas / bloklangan) — ro'yhatdan olib
+                     tashlash mumkin.
+        doimiy_xato=False bo'lsa — vaqtinchalik holat (masalan
+                     guruh vaqtincha band/flood-wait) — guruh
+                     o'chirilmaydi, keyingi rejalashtirilgan
+                     yuborishda avtomatik qayta urinadi.
     """
     chat_id = parse_chat_id(link)
 
     try:
         await client.send_message(chat_id, text)
-        return True, ""
+        return True, "", False
 
     except FloodWait as e:
-        logger.warning(f"FloodWait {e.value}s — {link}")
-        await asyncio.sleep(e.value + 2)
-        try:
-            await client.send_message(chat_id, text)
-            return True, ""
-        except Exception as e2:
-            return False, f"FloodWait keyin xato: {e2}"
+        # Qisqa kutish (masalan 2 daqiqagacha) — shu yerning o'zida kutib,
+        # keyin yuboramiz. Uzoqroq bo'lsa — hozircha o'tkazib yuboramiz,
+        # guruh o'chirilmaydi, keyingi safar avtomatik qayta urinadi.
+        if e.value <= config.FLOOD_WAIT_INLINE_MAX:
+            logger.info(f"FloodWait {e.value}s — {link}, kutilmoqda...")
+            await asyncio.sleep(e.value + 1)
+            try:
+                await client.send_message(chat_id, text)
+                return True, "", False
+            except FloodWait as e2:
+                return False, f"Guruh vaqtincha band ({e2.value}s)", False
+            except Exception as e2:
+                return False, f"Kutishdan keyin xato: {e2}", False
+        else:
+            logger.info(
+                f"FloodWait {e.value}s — {link}, keyingi safar urinib ko'riladi"
+            )
+            return False, f"Guruh vaqtincha band ({e.value}s), navbatda kutmoqda", False
 
     except (ChatWriteForbidden, ChatAdminRequired):
-        return False, "Yozish huquqi yo'q"
+        return False, "Yozish huquqi yo'q", True
 
     except UserBannedInChannel:
-        return False, "Akkaunt kanalda bloklangan"
+        return False, "Akkaunt kanalda bloklangan", True
 
     except ChannelPrivate:
-        return False, "Kanal yopiq yoki akkaunt a'zo emas"
+        return False, "Kanal yopiq yoki akkaunt a'zo emas", True
 
     except UserNotParticipant:
-        return False, "Akkaunt guruh/kanalga a'zo emas"
+        return False, "Akkaunt guruh/kanalga a'zo emas", True
 
     except PeerIdInvalid:
-        return False, "Noto'g'ri link yoki akkaunt bu guruhni topa olmaydi"
+        return False, "Noto'g'ri link yoki akkaunt bu guruhni topa olmaydi", True
 
     except Exception as e:
         logger.error(f"Xabar yuborishda xato ({link}): {type(e).__name__}: {e}")
-        return False, str(e)
+        return False, str(e), False
 
 
 # ─── Telegram akkaunt ulash (OTP jarayoni) ─────────────────────────────

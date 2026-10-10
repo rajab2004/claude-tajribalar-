@@ -9,7 +9,8 @@ from sqlalchemy.orm import selectinload
 
 from database.models import (
     Admin, User, UserSession, Channel,
-    Announcement, SendLog, AnnouncementStatus
+    Announcement, SendLog, AnnouncementStatus,
+    StartEvent, SharedChannel
 )
 from services.crypto import hash_password, verify_password, encrypt_text, decrypt_text
 import config
@@ -88,12 +89,13 @@ async def update_admin_info(db: AsyncSession, admin_id: int, **kwargs):
 # ═══════════════════════════════════════════════════════
 
 async def create_user(db: AsyncSession, telegram_id: int, phone: str,
-                       password: str, months: int,
-                       admin_id: int) -> tuple[User, str]:
+                       password: str, days: int,
+                       admin_id: int) -> User:
     """
-    Returns: (user, plain_password)
+    days: foydalanuvchiga beriladigan muddat (kunlarda).
+    Masalan 3 kunlik bepul sinov yoki 30/60/.../360 kun (1-12 oy).
     """
-    expires_at = datetime.utcnow() + timedelta(days=30 * months)
+    expires_at = datetime.utcnow() + timedelta(days=days)
     user = User(
         telegram_id=telegram_id,
         phone=phone,
@@ -158,12 +160,12 @@ async def update_user_password(db: AsyncSession, user_id: int,
     )
 
 
-async def extend_user_expiry(db: AsyncSession, user_id: int, months: int):
+async def extend_user_expiry(db: AsyncSession, user_id: int, days: int):
     user = await get_user_by_id(db, user_id)
     if not user:
         return
     base = max(user.expires_at, datetime.utcnow())
-    new_expiry = base + timedelta(days=30 * months)
+    new_expiry = base + timedelta(days=days)
     await db.execute(
         update(User).where(User.id == user_id)
         .values(expires_at=new_expiry, is_active=True, wrong_attempts=0)
@@ -215,6 +217,62 @@ async def update_user_interval(db: AsyncSession, user_id: int, minutes: int):
 async def reset_wrong_attempts(db: AsyncSession, user_id: int):
     await db.execute(
         update(User).where(User.id == user_id).values(wrong_attempts=0)
+    )
+
+
+async def set_user_shared_permission(db: AsyncSession, user_id: int,
+                                      allowed: bool):
+    """Admin foydalanuvchiga umumiy guruh linklaridan foydalanishga
+    ruxsat beradi yoki bekor qiladi."""
+    await db.execute(
+        update(User).where(User.id == user_id)
+        .values(use_shared_channels=allowed)
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  START EVENT CRUD (bot(ga) /start bosgan yangi odamlar)
+# ═══════════════════════════════════════════════════════
+
+async def log_start_event(db: AsyncSession, telegram_id: int,
+                           username: str | None, full_name: str | None):
+    result = await db.execute(
+        select(StartEvent).where(StartEvent.telegram_id == telegram_id)
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        existing.username = username
+        existing.full_name = full_name
+        existing.started_at = datetime.utcnow()
+    else:
+        db.add(StartEvent(
+            telegram_id=telegram_id,
+            username=username,
+            full_name=full_name,
+        ))
+    await db.flush()
+
+
+async def get_pending_start_events(db: AsyncSession) -> List[StartEvent]:
+    """Hali ruxsat berilmagan va foydalanuvchi sifatida qo'shilmagan
+    /start bosganlar ro'yhati."""
+    result = await db.execute(
+        select(StartEvent).where(StartEvent.granted == False)
+        .order_by(StartEvent.started_at.desc())
+    )
+    events = list(result.scalars().all())
+    output = []
+    for ev in events:
+        user = await get_user_by_telegram_id(db, ev.telegram_id)
+        if user is None:
+            output.append(ev)
+    return output
+
+
+async def mark_start_event_granted(db: AsyncSession, telegram_id: int):
+    await db.execute(
+        update(StartEvent).where(StartEvent.telegram_id == telegram_id)
+        .values(granted=True)
     )
 
 
@@ -288,6 +346,51 @@ async def add_channel(db: AsyncSession, user_id: int,
     return ch
 
 
+async def get_user_channel_links(db: AsyncSession, user_id: int) -> set[str]:
+    result = await db.execute(
+        select(Channel.link).where(
+            Channel.user_id == user_id,
+            Channel.is_active == True
+        )
+    )
+    return set(result.scalars().all())
+
+
+async def add_channels_bulk(db: AsyncSession, user_id: int,
+                             links: list[str]) -> dict:
+    """
+    1 tadan 150 tagacha linkni bittalab (har biri faqat 1 marta) saqlaydi.
+    Takroriylarni va limitdan oshganlarini o'tkazib yuboradi.
+    Returns: {"added": int, "duplicates": int, "overflow": int}
+    """
+    existing = await get_user_channel_links(db, user_id)
+    count_result = await db.execute(
+        select(func.count(Channel.id)).where(
+            Channel.user_id == user_id,
+            Channel.is_active == True
+        )
+    )
+    current_count = count_result.scalar() or 0
+
+    added = 0
+    duplicates = 0
+    overflow = 0
+    for link in links:
+        if link in existing:
+            duplicates += 1
+            continue
+        if current_count >= config.MAX_CHANNELS:
+            overflow += 1
+            continue
+        db.add(Channel(user_id=user_id, link=link))
+        existing.add(link)
+        current_count += 1
+        added += 1
+
+    await db.flush()
+    return {"added": added, "duplicates": duplicates, "overflow": overflow}
+
+
 async def get_user_channels(db: AsyncSession, user_id: int) -> List[Channel]:
     result = await db.execute(
         select(Channel).where(
@@ -312,6 +415,76 @@ async def deactivate_channel(db: AsyncSession, channel_id: int):
     await db.execute(
         delete(Channel).where(Channel.id == channel_id)
     )
+
+
+# ═══════════════════════════════════════════════════════
+#  SHARED CHANNEL CRUD (admin qo'shgan umumiy guruh linklari)
+# ═══════════════════════════════════════════════════════
+
+async def get_shared_channel_links(db: AsyncSession) -> set[str]:
+    result = await db.execute(select(SharedChannel.link))
+    return set(result.scalars().all())
+
+
+async def add_shared_channel(db: AsyncSession, link: str) -> bool:
+    existing = await get_shared_channel_links(db)
+    if link in existing:
+        return False
+    db.add(SharedChannel(link=link))
+    await db.flush()
+    return True
+
+
+async def add_shared_channels_bulk(db: AsyncSession,
+                                    links: list[str]) -> dict:
+    existing = await get_shared_channel_links(db)
+    count = len(existing)
+    added, duplicates, overflow = 0, 0, 0
+    for link in links:
+        if link in existing:
+            duplicates += 1
+            continue
+        if count >= config.MAX_SHARED_CHANNELS:
+            overflow += 1
+            continue
+        db.add(SharedChannel(link=link))
+        existing.add(link)
+        count += 1
+        added += 1
+    await db.flush()
+    return {"added": added, "duplicates": duplicates, "overflow": overflow}
+
+
+async def get_shared_channels(db: AsyncSession) -> List[SharedChannel]:
+    result = await db.execute(
+        select(SharedChannel).order_by(SharedChannel.added_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def count_shared_channels(db: AsyncSession) -> int:
+    result = await db.execute(select(func.count(SharedChannel.id)))
+    return result.scalar() or 0
+
+
+async def delete_shared_channel(db: AsyncSession, ch_id: int):
+    await db.execute(delete(SharedChannel).where(SharedChannel.id == ch_id))
+
+
+async def get_effective_channels(db: AsyncSession,
+                                  user: User) -> tuple[List[Channel], List[SharedChannel]]:
+    """
+    E'lon yuboriladigan guruhlar ro'yhati:
+    — foydalanuvchi o'zi qo'shgan guruhlar (har doim)
+    — + agar admin ruxsat bergan bo'lsa, umumiy guruh linklari ham
+    Auto-join yo'q — faqat aynan shu ro'yhatdagi, foydalanuvchi
+    allaqachon a'zo bo'lgan guruhlarga yoziladi.
+    """
+    own = await get_user_channels(db, user.id)
+    shared: List[SharedChannel] = []
+    if user.use_shared_channels:
+        shared = await get_shared_channels(db)
+    return own, shared
 
 
 # ═══════════════════════════════════════════════════════

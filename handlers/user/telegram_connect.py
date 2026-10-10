@@ -14,7 +14,7 @@ from services.pyrogram_client import (
 from utils.keyboards import (
     user_main_menu, share_contact_keyboard, remove_keyboard
 )
-from utils.helpers import normalize_phone
+from utils.helpers import normalize_phone, normalize_otp_code
 import config
 
 router = Router()
@@ -95,7 +95,10 @@ async def _send_otp(message: Message, state: FSMContext, phone: str):
 
 @router.message(TelegramConnectStates.waiting_otp)
 async def connect_otp(message: Message, state: FSMContext, db: AsyncSession):
-    code = message.text.strip().replace(" ", "").replace("-", "")
+    # Telegram kodni ba'zan ichiga nuqta/chiziqcha qo'yib yuboradi
+    # (masalan 12345 o'rniga 1.2345 yoki 1234-5 ko'rinishida) — shu sababli
+    # faqat raqamlarni ajratib olib tekshiramiz.
+    code = normalize_otp_code(message.text)
     data = await state.get_data()
 
     success, result, extra = await verify_otp(
